@@ -12,7 +12,7 @@ input that becomes your default:
 A setup wizard listens to your room, your voice and your typing, then suggests
 settings.
 
-![The Mic FX panel (left) and the setup wizard's suggested settings (right)](preview.png)
+![The Mic FX panel](preview.png)
 
 ## What you get
 
@@ -53,6 +53,8 @@ From those it suggests:
 - **Compressor threshold and makeup**, relative to your speech, for an output
   that averages about −18 dBFS.
 - **Limiter** at −1 dBFS.
+
+![The setup wizard's suggested settings](wizard.png)
 
 While the wizard records, the gate, compressor and limiter are bypassed, so it
 measures exactly what the gate would see. Your settings come back afterwards,
