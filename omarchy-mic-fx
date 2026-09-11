@@ -1,0 +1,1153 @@
+#!/usr/bin/env python3
+"""omarchy-mic-fx: the helper behind the io.github.codemonkey76.micfx Omarchy widget.
+
+Puts a processed copy of a microphone in front of it -- input gain, high-pass,
+RNNoise noise suppression, gate, compressor, limiter -- as a virtual source
+that every app (Zoom, Teams, browsers) can record from. The chain is a
+PipeWire filter-chain hosted by its own PipeWire client under a systemd user
+service, the way Omarchy hosts its speaker tuning, so switching it on and off
+never restarts the audio daemon.
+
+  omarchy-mic-fx status                  everything the widget shows, as JSON
+  omarchy-mic-fx on [--keep-default]     start it and make it the default input
+  omarchy-mic-fx off                     stop it and give the default input back
+  omarchy-mic-fx default                 make the running chain the default input
+  omarchy-mic-fx set KEY VALUE           change one setting, live and saved
+  omarchy-mic-fx device NAME             process a different input device
+  omarchy-mic-fx devices                 input devices that can be processed
+  omarchy-mic-fx reset                   back to the default settings
+  omarchy-mic-fx render                  print the PipeWire config it would use
+  omarchy-mic-fx uninstall               stop it and remove its service and config
+  omarchy-mic-fx calibrate PHASE SECS    record one wizard phase: quiet, speech or typing
+  omarchy-mic-fx calibrate solve         settings suggested by the recorded phases
+  omarchy-mic-fx calibrate apply         apply those suggestions
+  omarchy-mic-fx calibrate preview       mix the typing over the talking, before and after the chain
+  omarchy-mic-fx calibrate play WHICH    play that preview: before or after
+  omarchy-mic-fx calibrate clear         delete the wizard's audio clips
+
+Files it writes are opened without following symlinks and replaced
+atomically, so a planted link can't redirect them. The wizard's talking and
+typing clips live only in the memory-backed runtime directory, for the
+preview, and are deleted when the wizard closes.
+"""
+
+import array
+import io
+import json
+import math
+import os
+import re
+import secrets
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+import wave
+
+NAME = "omarchy-mic-fx"
+SOURCE = "omarchy_mic_fx"                 # the processed virtual source
+CAPTURE = "omarchy_mic_fx.capture"       # the chain's input stream
+UNIT = "omarchy-mic-fx.service"
+HOST_CONF = "omarchy-mic-fx.conf"
+
+HOME = os.path.expanduser("~")
+CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")
+SETTINGS_DIR = os.path.join(CONFIG_HOME, NAME)
+STATE_DIR = os.path.join(STATE_HOME, NAME)
+CALIBRATION_DIR = os.path.join(STATE_DIR, "calibration")
+# The wizard's talking and typing clips, and its before/after preview, live in
+# the runtime directory: memory-backed, private, gone at logout, and deleted
+# when the wizard closes. What the wizard keeps afterwards is levels only.
+RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or STATE_HOME, NAME)
+PREVIEW_SINK = "omarchy_mic_fx_preview_in"
+PREVIEW_SOURCE = "omarchy_mic_fx_preview"
+PREVIEW_CAPTURE = "omarchy_mic_fx_preview.capture"
+PIPEWIRE_DIR = os.path.join(CONFIG_HOME, "pipewire")
+UNIT_DIR = os.path.join(CONFIG_HOME, "systemd", "user")
+
+RNNOISE = "/usr/lib/ladspa/librnnoise_ladspa.so"
+LSP = "/usr/lib/lv2/lsp-plugins.lv2"
+LSP_URI = "http://lsp-plug.in/plugins/lv2/"
+RATE = 48000
+WINDOW = RATE // 10                       # 100 ms analysis windows
+
+# key: (default, minimum, maximum). Levels in dB, times in ms.
+SETTINGS = {
+    "gain":              (0.0,   -12.0, 24.0),
+    "hpf.enabled":       (True,  None,  None),
+    "hpf.freq":          (80.0,   20.0, 300.0),
+    "suppress.enabled":  (True,  None,  None),
+    "suppress.strength": (100.0,   0.0, 100.0),
+    "suppress.vad":      (0.0,     0.0, 95.0),
+    "gate.enabled":      (True,  None,  None),
+    "gate.threshold":    (-50.0, -90.0, -10.0),
+    "gate.range":        (-30.0, -80.0, 0.0),
+    "gate.hysteresis":   (6.0,     0.0, 20.0),
+    "gate.attack":       (5.0,     0.0, 100.0),
+    "gate.hold":         (100.0,   0.0, 500.0),
+    "gate.release":      (150.0,   5.0, 1000.0),
+    "comp.enabled":      (True,  None,  None),
+    "comp.threshold":    (-30.0, -60.0, 0.0),
+    "comp.ratio":        (3.0,     1.0, 20.0),
+    "comp.knee":         (6.0,     0.0, 24.0),
+    "comp.attack":       (10.0,    0.0, 200.0),
+    "comp.release":      (150.0,  10.0, 1000.0),
+    "comp.makeup":       (6.0,     0.0, 24.0),
+    "limit.enabled":     (True,  None,  None),
+    "limit.ceiling":     (-1.0,  -24.0, 0.0),
+    "limit.release":     (20.0,    0.25, 20.0),
+}
+
+
+# ---------------------------------------------------------------- output
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def fail(message, code=1):
+    emit({"ok": False, "error": message})
+    sys.exit(code)
+
+
+def lin(db):
+    return 10 ** (db / 20.0)
+
+
+def to_db(value):
+    return 20 * math.log10(value) if value > 0 else -120.0
+
+
+# ---------------------------------------------------------------- files
+# Every directory is opened one component at a time from /, never following a
+# symlink unless root owns it (an administrator's choice, such as /home
+# pointing elsewhere). Reads accept only a small regular file of ours; writes
+# go to a random O_EXCL temporary file that is fsynced and renamed into place
+# relative to the directory already held open.
+
+def open_dir(path, create):
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for name in [p for p in path.split("/") if p]:
+            if name in (".", ".."):
+                raise OSError("path contains . or ..")
+            try:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if not create:
+                    return None
+                os.mkdir(name, 0o700, dir_fd=fd)
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            if stat.S_ISLNK(st.st_mode):
+                if st.st_uid != 0:
+                    raise OSError("not following the symlink at %r in %s" % (name, path))
+            else:
+                flags |= os.O_NOFOLLOW
+            child = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid() or st.st_mode & 0o022:
+            raise OSError("%s must be yours and not writable by others" % path)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_file(directory, name, limit=1 << 20, binary=False):
+    parent = open_dir(directory, create=False)
+    if parent is None:
+        return None
+    try:
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        except FileNotFoundError:
+            return None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1 or st.st_size > limit:
+                raise OSError("ignoring unexpected file %s/%s" % (directory, name))
+            chunks, total = [], 0
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise OSError("%s/%s is too large" % (directory, name))
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            return data if binary else data.decode("utf-8")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent)
+
+
+def write_file(directory, name, text, mode=0o600):
+    parent = open_dir(directory, create=True)
+    tmp = ".%s.%s" % (name, secrets.token_hex(8))
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=parent)
+        try:
+            data = text.encode("utf-8") if isinstance(text, str) else bytes(text)
+            while data:
+                data = data[os.write(fd, data):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=parent)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(parent)
+
+
+def remove_file(directory, name):
+    parent = open_dir(directory, create=False)
+    if parent is None:
+        return
+    try:
+        os.unlink(name, dir_fd=parent)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(parent)
+
+
+def read_json(directory, name, default):
+    try:
+        text = read_file(directory, name)
+        return json.loads(text) if text else default
+    except (OSError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------- settings
+
+def coerce(key, value):
+    default, low, high = SETTINGS[key]
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in ("1", "true", "on", "yes"):
+            return True
+        if text in ("0", "false", "off", "no"):
+            return False
+        raise ValueError("%s takes on or off" % key)
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("%s must be a number" % key)
+    return round(min(high, max(low, number)), 2)
+
+
+def load_settings():
+    stored = read_json(SETTINGS_DIR, "settings.json", {})
+    settings = {key: spec[0] for key, spec in SETTINGS.items()}
+    for key in SETTINGS:
+        if key in stored:
+            try:
+                settings[key] = coerce(key, stored[key])
+            except (TypeError, ValueError):
+                pass
+    device = stored.get("device", "")
+    settings["device"] = device if isinstance(device, str) and valid_node_name(device) else ""
+    return settings
+
+
+def save_settings(settings):
+    write_file(SETTINGS_DIR, "settings.json", json.dumps(settings, indent=2, sort_keys=True) + "\n")
+
+
+def valid_node_name(name):
+    return bool(re.fullmatch(r"[A-Za-z0-9_.:@+-]{1,200}", name or ""))
+
+
+# The chain's controls, in the plugins' own units, for a set of settings.
+def controls(s):
+    c = {
+        "pre:Gain 1": lin(s["gain"]),
+        "hp:Freq": s["hpf.freq"] if s["hpf.enabled"] else 5.0,
+        "hp:Q": 0.707,
+        "rnnoise:Dry Mix": (1 - s["suppress.strength"] / 100.0) if s["suppress.enabled"] else 1.0,
+        "rnnoise:VAD Threshold (%)": s["suppress.vad"] if s["suppress.enabled"] else 0.0,
+        "rnnoise:VAD Grace Period (ms)": 200.0,
+        "rnnoise:Retroactive VAD Grace (ms)": 50.0,
+        "gate:enabled": 1.0 if s["gate.enabled"] else 0.0,
+        "gate:gt": lin(s["gate.threshold"]),
+        "gate:gz": max(0.001, lin(-s["gate.hysteresis"])),
+        "gate:gr": lin(s["gate.range"]),
+        "gate:at": s["gate.attack"],
+        "gate:hold": s["gate.hold"],
+        "gate:rt": s["gate.release"],
+        "gate:mk": 1.0,
+        "comp:enabled": 1.0 if s["comp.enabled"] else 0.0,
+        "comp:cm": 0.0,
+        "comp:al": lin(s["comp.threshold"]),
+        "comp:cr": s["comp.ratio"],
+        "comp:kn": max(0.0631, lin(-s["comp.knee"])),
+        "comp:at": s["comp.attack"],
+        "comp:rt": s["comp.release"],
+        "comp:mk": lin(s["comp.makeup"]),
+        "limit:enabled": 1.0 if s["limit.enabled"] else 0.0,
+        "limit:alr": 0.0,
+        "limit:boost": 0.0,
+        "limit:th": lin(s["limit.ceiling"]),
+        "limit:lk": 5.0,
+        "limit:at": 5.0,
+        "limit:rt": s["limit.release"],
+    }
+    return c
+
+
+# ---------------------------------------------------------------- audio graph
+
+def run(args, timeout=10, check=False):
+    try:
+        done = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if check and done.returncode != 0:
+        return None
+    return done
+
+
+def sources():
+    done = run(["pactl", "-f", "json", "list", "sources"])
+    if not done or done.returncode != 0:
+        return []
+    try:
+        return json.loads(done.stdout)
+    except ValueError:
+        return []
+
+
+def input_devices():
+    out = []
+    for src in sources():
+        name = src.get("name", "")
+        props = src.get("properties", {})
+        # Not our own sources (the chain, its preview), and not monitors of outputs.
+        if name.startswith(SOURCE) or name.endswith(".monitor") or props.get("device.class") == "monitor":
+            continue
+        if not valid_node_name(name):
+            continue
+        out.append({"name": name, "description": src.get("description") or name,
+                    "channels": src.get("channel_map", "").count(",") + 1 if src.get("channel_map") else 1})
+    return out
+
+
+def default_source():
+    done = run(["pactl", "get-default-source"])
+    return done.stdout.strip() if done and done.returncode == 0 else ""
+
+
+def source_present(name):
+    return any(src.get("name") == name for src in sources())
+
+
+def capture_node_id():
+    done = run(["pw-dump"], timeout=10)
+    if not done or done.returncode != 0:
+        return None
+    try:
+        for obj in json.loads(done.stdout):
+            props = (obj.get("info") or {}).get("props") or {}
+            if obj.get("type") == "PipeWire:Interface:Node" and props.get("node.name") == CAPTURE:
+                return obj.get("id")
+    except ValueError:
+        pass
+    return None
+
+
+# Device descriptions come from the hardware (a USB device names itself), so
+# they're quoted, stripped of control characters and capped before they go
+# into the generated config.
+def spa_string(text):
+    text = "".join(ch for ch in str(text)[:200] if ch >= " " and ch != "\x7f")
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def source_state():
+    for src in sources():
+        if src.get("name") == SOURCE:
+            return src.get("state", "")
+    return ""
+
+
+def node_controls(node):
+    done = run(["pw-dump", str(node)], timeout=10)
+    found = {}
+    if not done or done.returncode != 0:
+        return found
+    try:
+        for obj in json.loads(done.stdout):
+            for props in ((obj.get("info") or {}).get("params") or {}).get("Props") or []:
+                params = props.get("params") or []
+                for i in range(0, len(params) - 1, 2):
+                    if isinstance(params[i], str) and isinstance(params[i + 1], (int, float)):
+                        found[params[i]] = float(params[i + 1])
+    except ValueError:
+        pass
+    return found
+
+
+def controls_match(node, values):
+    current = node_controls(node)
+    return all(k in current and abs(current[k] - float(v)) <= 1e-4 * max(1.0, abs(float(v))) for k, v in values.items())
+
+
+# A chain that hasn't processed audio since it started is suspended and
+# ignores control changes, so hold it awake with a throwaway recording while
+# they land, then read them back rather than assume.
+def apply_live(values):
+    node = capture_node_id()
+    if node is None:
+        return False
+    waker = subprocess.Popen(["parec", "-d", SOURCE, "--raw"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_for(lambda: source_state() == "RUNNING", 3)
+        params = " ".join("%s %s" % (spa_string(k), repr(float(v))) for k, v in values.items())
+        run(["pw-cli", "set-param", str(node), "Props", "{ params = [ %s ] }" % params])
+        return wait_for(lambda: controls_match(node, values), 3)
+    finally:
+        waker.terminate()
+        try:
+            waker.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            waker.kill()
+
+
+def resolve_device(settings):
+    if settings["device"]:
+        return settings["device"]
+    current = default_source()
+    if current and current != SOURCE and valid_node_name(current):
+        return current
+    devices = input_devices()
+    return devices[0]["name"] if devices else ""
+
+
+def describe(device):
+    for d in input_devices():
+        if d["name"] == device:
+            return d["description"]
+    return device
+
+
+# With preview, the chain is a throwaway copy that captures a temporary sink
+# instead of a microphone, under its own node names.
+def render(settings, device, preview=False):
+    c = controls(settings)
+    fmt = lambda v: ("%.6f" % v).rstrip("0").rstrip(".") if isinstance(v, float) else str(v)
+    def block(prefix):
+        items = ["%s = %s" % (spa_string(k.split(":", 1)[1]), fmt(v)) for k, v in c.items() if k.startswith(prefix + ":")]
+        return "{ " + " ".join(items) + " }"
+    label = spa_string("Mic FX preview" if preview else describe(device) + " (Mic FX)")
+    return """# Written by omarchy-mic-fx. Changes here are overwritten; use the widget or
+# `omarchy-mic-fx set` instead.
+
+context.properties = {{ log.level = 2 }}
+
+context.spa-libs = {{
+  audio.convert.* = audioconvert/libspa-audioconvert
+  support.*       = support/libspa-support
+}}
+
+context.modules = [
+  {{ name = libpipewire-module-rt args = {{ }} flags = [ ifexists nofail ] }}
+  {{ name = libpipewire-module-protocol-native }}
+  {{ name = libpipewire-module-client-node }}
+  {{ name = libpipewire-module-adapter }}
+  {{ name = libpipewire-module-filter-chain
+    args = {{
+      node.description = {label}
+      media.name       = {label}
+      filter.graph = {{
+        nodes = [
+          {{ type = builtin name = pre label = mixer control = {pre} }}
+          {{ type = builtin name = hp label = bq_highpass control = {hp} }}
+          {{ type = ladspa name = rnnoise plugin = "librnnoise_ladspa" label = noise_suppressor_mono control = {rnnoise} }}
+          {{ type = lv2 name = gate plugin = "{lsp}gate_mono" control = {gate} }}
+          {{ type = lv2 name = comp plugin = "{lsp}compressor_mono" control = {comp} }}
+          {{ type = lv2 name = limit plugin = "{lsp}limiter_mono" control = {limit} }}
+        ]
+        links = [
+          {{ output = "pre:Out"        input = "hp:In" }}
+          {{ output = "hp:Out"         input = "rnnoise:Input" }}
+          {{ output = "rnnoise:Output" input = "gate:in" }}
+          {{ output = "gate:out"       input = "comp:in" }}
+          {{ output = "comp:out"       input = "limit:in" }}
+        ]
+        inputs  = [ "pre:In 1" ]
+        outputs = [ "limit:out" ]
+      }}
+      audio.channels = 1
+      audio.position = [ MONO ]
+      capture.props = {{
+        node.name          = "{capture}"
+        node.passive       = {passive}
+        target.object      = {device}{capture_sink}
+        # Wait for this device rather than processing whatever else is there.
+        node.dont-fallback = true
+        node.linger        = true
+        node.dont-move     = true
+      }}
+      playback.props = {{
+        node.name   = "{source}"
+        media.class = Audio/Source
+      }}
+    }}
+  }}
+]
+""".format(label=label, pre=block("pre"), hp=block("hp"), rnnoise=block("rnnoise"), gate=block("gate"),
+           comp=block("comp"), limit=block("limit"), lsp=LSP_URI,
+           capture=PREVIEW_CAPTURE if preview else CAPTURE, source=PREVIEW_SOURCE if preview else SOURCE,
+           passive="false" if preview else "true",
+           capture_sink="\n        stream.capture.sink = true" if preview else "",
+           device=spa_string(device))
+
+
+UNIT_TEXT = """# Written by omarchy-mic-fx.
+[Unit]
+Description=Omarchy Mic FX (processed microphone)
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+Wants=wireplumber.service
+# The filter-chain loses its connection when PipeWire goes away.
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pipewire -c {conf}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+""".format(conf=HOST_CONF)
+
+
+def systemctl(*args):
+    return run(["systemctl", "--user"] + list(args), timeout=30)
+
+
+def service_state():
+    done = systemctl("is-active", UNIT)
+    active = done.stdout.strip() if done else "unknown"
+    done = systemctl("is-enabled", UNIT)
+    enabled = done.stdout.strip() if done else "unknown"
+    return active or "inactive", enabled or "disabled"
+
+
+def deps_present():
+    return {"rnnoise": os.path.exists(RNNOISE),
+            "lsp": all(os.path.exists(os.path.join(LSP, p + ".ttl")) for p in ("gate_mono", "compressor_mono", "limiter_mono"))}
+
+
+def install_files(settings, device):
+    write_file(PIPEWIRE_DIR, HOST_CONF, render(settings, device), 0o644)
+    write_file(UNIT_DIR, UNIT, UNIT_TEXT, 0o644)
+    systemctl("daemon-reload")
+
+
+# Recording streams from apps. Our own capture stream carries no application name.
+def app_source_outputs(on_source):
+    done = run(["pactl", "-f", "json", "list", "source-outputs"])
+    if not done or done.returncode != 0:
+        return []
+    try:
+        outputs = json.loads(done.stdout)
+    except ValueError:
+        return []
+    index = {src.get("index"): src.get("name") for src in sources()}
+    ids = []
+    for out in outputs:
+        props = out.get("properties", {})
+        if props.get("node.name") == CAPTURE or not props.get("application.name"):
+            continue
+        if index.get(out.get("source")) == on_source:
+            ids.append(str(out.get("index")))
+    return ids
+
+
+def move_apps(from_source, to_source):
+    for oid in app_source_outputs(from_source):
+        run(["pactl", "move-source-output", oid, to_source])
+
+
+def wait_for(predicate, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        if predicate():
+            return True
+        time.sleep(0.25)
+    return predicate()
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_status():
+    settings = load_settings()
+    active, enabled = service_state()
+    device = resolve_device(settings)
+    present = source_present(SOURCE)
+    calib = {p: read_file(CALIBRATION_DIR, p + ".json", 4 << 20) is not None for p in ("quiet", "speech", "typing")}
+    emit({
+        "ok": True,
+        "deps": deps_present(),
+        "service": active,
+        "enabled": enabled == "enabled",
+        "present": present,
+        "isDefault": present and default_source() == SOURCE,
+        "device": {"name": device, "description": describe(device) if device else "",
+                   "present": bool(device) and source_present(device)},
+        "devices": input_devices(),
+        "settings": {k: settings[k] for k in SETTINGS},
+        "calibration": {"phases": calib, "suggestion": read_json(CALIBRATION_DIR, "suggestion.json", None)},
+    })
+
+
+def cmd_on(keep_default):
+    deps = deps_present()
+    if not all(deps.values()):
+        fail("missing " + " and ".join(k for k, v in deps.items() if not v) +
+             ": install noise-suppression-for-voice and lsp-plugins-lv2")
+    settings = load_settings()
+    device = resolve_device(settings)
+    if not device or not source_present(device):
+        fail("no input device to process")
+    if not settings["device"]:
+        settings["device"] = device
+        save_settings(settings)
+    install_files(settings, device)
+    systemctl("enable", UNIT)
+    systemctl("restart", UNIT)
+    if not wait_for(lambda: source_present(SOURCE), 10):
+        systemctl("disable", "--now", UNIT)
+        fail("the processed source never appeared; see: systemctl --user status " + UNIT)
+    if not keep_default:
+        current = default_source()
+        if current and current != SOURCE:
+            write_file(STATE_DIR, "previous-default", current + "\n")
+        run(["pactl", "set-default-source", SOURCE])
+        move_apps(device, SOURCE)
+    emit({"ok": True, "source": SOURCE, "device": device, "isDefault": default_source() == SOURCE})
+
+
+def cmd_default():
+    if not source_present(SOURCE):
+        fail("Mic FX isn't on")
+    device = resolve_device(load_settings())
+    current = default_source()
+    if current and current != SOURCE:
+        write_file(STATE_DIR, "previous-default", current + "\n")
+    run(["pactl", "set-default-source", SOURCE])
+    move_apps(device, SOURCE)
+    emit({"ok": True, "isDefault": default_source() == SOURCE})
+
+
+def cmd_off():
+    settings = load_settings()
+    device = resolve_device(settings)
+    previous = (read_file(STATE_DIR, "previous-default", 4096) or "").strip()
+    fallback = previous if previous and previous != SOURCE and source_present(previous) else device
+    if default_source() == SOURCE and fallback:
+        run(["pactl", "set-default-source", fallback])
+    if fallback:
+        move_apps(SOURCE, fallback)
+    systemctl("disable", "--now", UNIT)
+    wait_for(lambda: not source_present(SOURCE), 5)
+    emit({"ok": True, "default": default_source()})
+
+
+def cmd_set(key, value):
+    if key not in SETTINGS:
+        fail("unknown setting %r" % key)
+    settings = load_settings()
+    try:
+        settings[key] = coerce(key, value)
+    except (TypeError, ValueError) as e:
+        fail(str(e))
+    save_settings(settings)
+    stage = key.split(".")[0]
+    prefix = {"gain": "pre", "hpf": "hp", "suppress": "rnnoise", "gate": "gate", "comp": "comp", "limit": "limit"}[stage]
+    live = False
+    if source_present(SOURCE):
+        live = apply_live({k: v for k, v in controls(settings).items() if k.startswith(prefix + ":")})
+        write_file(PIPEWIRE_DIR, HOST_CONF, render(settings, resolve_device(settings)), 0o644)
+    emit({"ok": True, "key": key, "value": settings[key], "live": live})
+
+
+def cmd_device(name):
+    if not valid_node_name(name) or not any(d["name"] == name for d in input_devices()):
+        fail("no input device named %r" % name)
+    settings = load_settings()
+    settings["device"] = name
+    save_settings(settings)
+    if source_present(SOURCE):
+        install_files(settings, name)
+        systemctl("restart", UNIT)
+        wait_for(lambda: source_present(SOURCE), 10)
+    emit({"ok": True, "device": name})
+
+
+def cmd_reset():
+    settings = load_settings()
+    fresh = {key: spec[0] for key, spec in SETTINGS.items()}
+    fresh["device"] = settings["device"]
+    save_settings(fresh)
+    if source_present(SOURCE):
+        apply_live(controls(fresh))
+        write_file(PIPEWIRE_DIR, HOST_CONF, render(fresh, resolve_device(fresh)), 0o644)
+    emit({"ok": True})
+
+
+def cmd_uninstall():
+    cmd_off_quiet()
+    remove_file(UNIT_DIR, UNIT)
+    remove_file(PIPEWIRE_DIR, HOST_CONF)
+    systemctl("daemon-reload")
+    emit({"ok": True})
+
+
+def cmd_off_quiet():
+    saved = sys.stdout
+    sys.stdout = open(os.devnull, "w")
+    try:
+        cmd_off()
+    finally:
+        sys.stdout.close()
+        sys.stdout = saved
+
+
+# ---------------------------------------------------------------- calibration
+# Each phase records the raw device and the chain's output side by side. For
+# the recording, the gate, compressor and limiter are bypassed, the input gain
+# is set to 0 dB and suppression to full, so the chain's output is exactly what
+# the gate would see after RNNoise. The user's settings come back afterwards,
+# however the phase ends.
+
+def record(device, seconds, on_level, keep=False, stats=None):
+    procs = {}
+    levels = {"raw": [], "fx": []}
+    clip = []
+    peak = [0.0]      # the raw device's loudest sample, to catch clipping at the interface
+    def reader(key, source):
+        p = subprocess.Popen(["parec", "-d", source, "--format=float32le", "--rate=%d" % RATE,
+                              "--channels=1", "--raw", "--latency-msec=50"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        procs[key] = p
+        need = WINDOW * 4
+        buf = b""
+        while True:
+            chunk = p.stdout.read(need - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) == need:
+                a = array.array("f", buf)
+                levels[key].append(to_db(math.sqrt(sum(x * x for x in a) / len(a))))
+                if key == "raw":
+                    peak[0] = max(peak[0], max(a), -min(a))
+                    if keep:
+                        clip.append(buf)
+                buf = b""
+    threads = [threading.Thread(target=reader, args=("raw", device), daemon=True),
+               threading.Thread(target=reader, args=("fx", SOURCE), daemon=True)]
+    for t in threads:
+        t.start()
+    start = time.time()
+    shown = 0
+    try:
+        while time.time() - start < seconds:
+            time.sleep(0.1)
+            n = min(len(levels["raw"]), len(levels["fx"]))
+            if n > shown:
+                on_level(levels["raw"][n - 1], levels["fx"][n - 1], time.time() - start)
+                shown = n
+    finally:
+        for p in procs.values():
+            p.terminate()
+        for t in threads:
+            t.join(timeout=2)
+    n = min(len(levels["raw"]), len(levels["fx"]))
+    if stats is not None:
+        stats["peak"] = to_db(peak[0])
+    return levels["raw"][:n], levels["fx"][:n], b"".join(clip)
+
+
+def percentile(values, p):
+    if not values:
+        return -120.0
+    s = sorted(values)
+    return s[min(len(s) - 1, max(0, int(p * (len(s) - 1) + 0.5)))]
+
+
+def cmd_calibrate(phase, seconds):
+    if phase not in ("quiet", "speech", "typing"):
+        fail("phase must be quiet, speech or typing")
+    try:
+        seconds = float(seconds)
+    except ValueError:
+        fail("seconds must be a number")
+    seconds = min(30.0, max(3.0, seconds))
+    if not source_present(SOURCE):
+        fail("turn Mic FX on first")
+    settings = load_settings()
+    device = resolve_device(settings)
+    measuring = dict(settings)
+    measuring.update({"gain": 0.0, "suppress.enabled": True, "suppress.strength": 100.0, "suppress.vad": 0.0,
+                      "gate.enabled": False, "comp.enabled": False, "limit.enabled": False})
+    restore = lambda *_: apply_live(controls(settings))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))
+    if not apply_live(controls(measuring)):
+        fail("could not reach the chain's controls")
+    # Stdout is a pipe to the panel, so it's block-buffered: each level has
+    # to be flushed or the meters only move once the recording ends.
+    def show_level(r, f, t):
+        sys.stdout.write("level %.1f %.1f %.1f\n" % (r, f, t))
+        sys.stdout.flush()
+    stats = {}
+    try:
+        time.sleep(0.3)   # let the bypass settle before measuring
+        raw, fx, clip = record(device, seconds, show_level, keep=phase in ("speech", "typing"), stats=stats)
+    finally:
+        restore()
+    if len(raw) < 10:
+        fail("too little audio was recorded")
+    summary = {
+        "phase": phase, "seconds": round(len(raw) / 10.0, 1), "time": int(time.time()),
+        "raw": {"p10": percentile(raw, 0.1), "p50": percentile(raw, 0.5), "p90": percentile(raw, 0.9),
+                "p95": percentile(raw, 0.95), "max": max(raw), "peak": stats.get("peak", -120.0)},
+        "fx": {"p10": percentile(fx, 0.1), "p50": percentile(fx, 0.5), "p90": percentile(fx, 0.9),
+               "p95": percentile(fx, 0.95), "max": max(fx)},
+        "windows": {"raw": [round(v, 1) for v in raw], "fx": [round(v, 1) for v in fx]},
+    }
+    write_file(CALIBRATION_DIR, phase + ".json", json.dumps(summary) + "\n")
+    # A new recording makes any earlier preview stale.
+    for stale in ("before.wav", "after.wav"):
+        remove_file(RUNTIME_DIR, stale)
+    if clip:
+        write_file(RUNTIME_DIR, phase + ".wav", wav_bytes(array.array("f", clip)), 0o600)
+    brief = {k: v for k, v in summary.items() if k != "windows"}
+    sys.stdout.write("result " + json.dumps(brief) + "\n")
+    sys.stdout.flush()
+
+
+def solve():
+    phases = {p: read_json(CALIBRATION_DIR, p + ".json", None) for p in ("quiet", "speech", "typing")}
+    missing = [p for p, v in phases.items() if not v]
+    if missing:
+        return None, "record these phases first: " + ", ".join(missing)
+    quiet, speech, typing = phases["quiet"], phases["speech"], phases["typing"]
+    notes = []
+
+    floor_raw = quiet["raw"]["p50"]
+    floor_fx = quiet["fx"]["p90"]
+    # Speech windows: clearly above the room's floor in the raw signal.
+    raw_w, fx_w = speech["windows"]["raw"], speech["windows"]["fx"]
+    active = [i for i, v in enumerate(raw_w) if v > floor_raw + 10]
+    if len(active) < 10:
+        return None, "the speech phase barely rose above the room's noise; try again closer to the mic, or turn up its gain"
+    speech_raw = percentile([raw_w[i] for i in active], 0.5)
+    speech_peak = max(raw_w[i] for i in active)
+    speech_fx = percentile([fx_w[i] for i in active], 0.5)
+    speech_fx_quiet = percentile([fx_w[i] for i in active], 0.2)
+    typing_fx = typing["fx"]["p95"]
+    typing_raw = typing["raw"]["p95"]
+
+    # Input gain: bring average speech to about -24 dBFS before the dynamics.
+    gain = round(min(24.0, max(0.0, -24.0 - speech_raw)), 1)
+    gain = min(gain, max(0.0, -6.0 - speech_peak))   # keep loud peaks clear of clipping
+    if gain > 12:
+        notes.append("Your speech is quiet at the interface (about %.0f dBFS). Turning up the AI-1's gain knob "
+                     "is better than %.0f dB of digital gain, which raises the noise with it." % (speech_raw, gain))
+    # Too hot: clipping happens in the interface, before anything here can help.
+    # Recordings from before the sample peak was tracked fall back to the
+    # loudest 100 ms, which sits at least 6 dB under the sample peak for speech.
+    sample_peak = min(0.0, max(speech["raw"].get("peak", speech_peak + 6),
+                               typing["raw"].get("peak", typing["raw"]["max"] + 6)))
+    over = speech_raw + 24
+    if sample_peak > -1:
+        notes.append("Your loudest sounds reach %.1f dBFS at the interface, which is clipping. Turn the AI-1's gain "
+                     "knob down by about %.0f dB, so talking reads around -24 dBFS, and run the wizard again. "
+                     "Nothing after the interface can undo clipping." % (sample_peak, max(3, over)))
+    elif sample_peak > -4:
+        notes.append("Your loudest sounds reach %.1f dBFS at the interface, close to clipping. Turning the AI-1's "
+                     "gain knob down by about %.0f dB would leave safe headroom." % (sample_peak, max(3, over)))
+    # Gate: open between the loudest non-speech after RNNoise and the quiet end of speech.
+    lower = max(floor_fx, typing_fx) + gain + 4
+    upper = speech_fx_quiet + gain - 3
+    vad = 0.0
+    if lower < upper:
+        threshold = lower + (upper - lower) * 0.4
+    else:
+        threshold = upper
+        vad = 60.0
+        notes.append("Typing gets through RNNoise at about the level of your quieter speech, so the gate alone "
+                     "can't separate them. Voice detection is switched on (60%) to cut typing between words.")
+    threshold = round(min(-20.0, max(-80.0, threshold)), 1)
+    # Compressor: threshold a little under average speech, output averaging about -18 dBFS.
+    level = speech_fx + gain
+    comp_th = round(min(-10.0, max(-50.0, level - 6)), 1)
+    ratio = 3.0
+    compressed = comp_th + (level - comp_th) / ratio if level > comp_th else level
+    makeup = round(min(18.0, max(0.0, -18.0 - compressed)), 1)
+
+    suggested = {"gain": gain, "suppress.enabled": True, "suppress.strength": 100.0, "suppress.vad": vad,
+                 "gate.enabled": True, "gate.threshold": threshold, "gate.range": -30.0,
+                 "comp.enabled": True, "comp.threshold": comp_th, "comp.ratio": ratio, "comp.makeup": makeup,
+                 "limit.enabled": True, "limit.ceiling": -1.0}
+    measured = {"floorRaw": round(floor_raw, 1), "floorAfterSuppression": round(floor_fx, 1),
+                "speech": round(speech_raw, 1), "speechPeak": round(speech_peak, 1),
+                "speechAfterSuppression": round(speech_fx, 1), "quietSpeechAfterSuppression": round(speech_fx_quiet, 1),
+                "typing": round(typing_raw, 1), "typingAfterSuppression": round(typing_fx, 1),
+                "suppressionDb": round(floor_raw - floor_fx, 1)}
+    return {"measured": measured, "suggested": suggested, "notes": notes}, None
+
+
+def cmd_calibrate_solve():
+    result, error = solve()
+    if error:
+        fail(error)
+    write_file(CALIBRATION_DIR, "suggestion.json", json.dumps(result) + "\n")
+    emit(dict(ok=True, **result))
+
+
+def cmd_calibrate_apply():
+    result = read_json(CALIBRATION_DIR, "suggestion.json", None)
+    if not result:
+        result, error = solve()
+        if error:
+            fail(error)
+    settings = load_settings()
+    for key, value in result["suggested"].items():
+        if key in SETTINGS:
+            settings[key] = coerce(key, value)
+    save_settings(settings)
+    live = False
+    if source_present(SOURCE):
+        live = apply_live(controls(settings))
+        write_file(PIPEWIRE_DIR, HOST_CONF, render(settings, resolve_device(settings)), 0o644)
+    emit({"ok": True, "live": live, "settings": {k: settings[k] for k in SETTINGS}})
+
+
+# ---------------------------------------------------------------- preview
+# The wizard's last step plays the typing mixed over the talking, first as
+# recorded and then through the suggested settings. The processed version
+# comes from a throwaway copy of the chain fed through a temporary null sink,
+# so the real chain, and any call using it, is never touched. Clips are
+# played from memory through pacat's stdin, never re-opened by path.
+
+def pcm16(samples):
+    return array.array("h", (max(-32767, min(32767, int(s * 32767))) for s in samples)).tobytes()
+
+
+def wav_bytes(samples):
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(pcm16(samples))
+    return out.getvalue()
+
+
+def wav_frames(data):
+    with wave.open(io.BytesIO(data), "rb") as w:
+        if w.getnchannels() != 1 or w.getsampwidth() != 2 or w.getframerate() != RATE:
+            raise ValueError("unexpected clip format")
+        return w.readframes(w.getnframes())
+
+
+def read_clip(name):
+    data = read_file(RUNTIME_DIR, name, 32 << 20, binary=True)
+    if data is None:
+        return None
+    return [x / 32767.0 for x in array.array("h", wav_frames(data))]
+
+
+def feed(proc, pcm):
+    # Writes block once pacat's buffer is full, so progress tracks playback.
+    step = WINDOW * 2
+    for offset in range(0, len(pcm), step):
+        proc.stdin.write(pcm[offset:offset + step])
+        sys.stdout.write("progress %.3f\n" % min(1.0, (offset + step) / float(len(pcm))))
+        sys.stdout.flush()
+    proc.stdin.close()
+
+
+def stop(proc):
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def suggested_settings():
+    settings = load_settings()
+    suggestion = read_json(CALIBRATION_DIR, "suggestion.json", None)
+    if suggestion and isinstance(suggestion.get("suggested"), dict):
+        for key, value in suggestion["suggested"].items():
+            if key in SETTINGS:
+                settings[key] = coerce(key, value)
+    return settings
+
+
+def default_sink():
+    done = run(["pactl", "get-default-sink"])
+    return done.stdout.strip() if done and done.returncode == 0 else ""
+
+
+def cmd_calibrate_preview():
+    speech, typing = read_clip("speech.wav"), read_clip("typing.wav")
+    if not speech or not typing:
+        fail("record the talking and typing steps first")
+    # The typing runs under the whole of the talking, looped if it's shorter.
+    mix = [max(-1.0, min(1.0, s + typing[i % len(typing)])) for i, s in enumerate(speech)]
+    write_file(RUNTIME_DIR, "before.wav", wav_bytes(mix), 0o600)
+    settings = suggested_settings()
+    sink_before, source_before = default_sink(), default_source()
+    module = chain = recorder = player = None
+    captured = []
+    lead = 0
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))
+    try:
+        done = run(["pactl", "load-module", "module-null-sink", "sink_name=" + PREVIEW_SINK,
+                    "sink_properties=device.description=Mic-FX-preview"])
+        module = done.stdout.strip() if done and done.returncode == 0 else None
+        if not module:
+            fail("couldn't create the preview's temporary sink")
+        write_file(RUNTIME_DIR, "preview.conf", render(settings, PREVIEW_SINK, preview=True), 0o600)
+        chain = subprocess.Popen(["pipewire", "-c", os.path.join(RUNTIME_DIR, "preview.conf")],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not wait_for(lambda: source_present(PREVIEW_SOURCE), 8):
+            fail("the preview chain didn't start")
+        recorder = subprocess.Popen(["parec", "-d", PREVIEW_SOURCE, "--format=float32le", "--rate=%d" % RATE,
+                                     "--channels=1", "--raw", "--latency-msec=50"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        def collect():
+            while True:
+                chunk = recorder.stdout.read(WINDOW * 4)
+                if not chunk:
+                    break
+                captured.append(chunk)
+        reader = threading.Thread(target=collect, daemon=True)
+        reader.start()
+        time.sleep(0.3)
+        lead = sum(len(c) for c in captured) // 4      # samples recorded before the clip starts
+        player = subprocess.Popen(["pacat", "--playback", "-d", PREVIEW_SINK, "--format=s16le",
+                                   "--rate=%d" % RATE, "--channels=1", "--latency-msec=100"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        feed(player, pcm16(mix))
+        player.wait(timeout=60)
+        time.sleep(0.5)                                 # let the chain's tail through
+        stop(recorder)
+        reader.join(timeout=3)
+    finally:
+        for proc in (player, recorder, chain):
+            stop(proc)
+        if module:
+            run(["pactl", "unload-module", module])
+        if sink_before and default_sink() != sink_before:
+            run(["pactl", "set-default-sink", sink_before])
+        if source_before and default_source() != source_before:
+            run(["pactl", "set-default-source", source_before])
+        remove_file(RUNTIME_DIR, "preview.conf")
+    processed = array.array("f", b"".join(captured))
+    after = processed[lead:lead + len(mix)]
+    if len(after) < RATE:
+        fail("the preview chain returned too little audio")
+    write_file(RUNTIME_DIR, "after.wav", wav_bytes(after), 0o600)
+    emit({"ok": True, "seconds": round(len(mix) / float(RATE), 1)})
+
+
+def cmd_calibrate_play(which):
+    if which not in ("before", "after"):
+        fail("play before or after")
+    clip = read_file(RUNTIME_DIR, which + ".wav", 32 << 20, binary=True)
+    if clip is None:
+        fail("build the preview first")
+    pcm = wav_frames(clip)
+    player = subprocess.Popen(["pacat", "--playback", "--format=s16le", "--rate=%d" % RATE, "--channels=1",
+                               "--latency-msec=100"], stdin=subprocess.PIPE,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))
+    try:
+        feed(player, pcm)
+        player.wait(timeout=90)
+    except BrokenPipeError:
+        pass
+    finally:
+        stop(player)
+    emit({"ok": True})
+
+
+def cmd_calibrate_clear():
+    for name in ("speech.wav", "typing.wav", "before.wav", "after.wav", "preview.conf"):
+        remove_file(RUNTIME_DIR, name)
+    emit({"ok": True})
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv):
+    if not argv or argv[0] == "status":
+        return cmd_status()
+    cmd, rest = argv[0], argv[1:]
+    try:
+        if cmd == "on":
+            return cmd_on("--keep-default" in rest)
+        if cmd == "off":
+            return cmd_off()
+        if cmd == "default":
+            return cmd_default()
+        if cmd == "set" and len(rest) == 2:
+            return cmd_set(rest[0], rest[1])
+        if cmd == "device" and len(rest) == 1:
+            return cmd_device(rest[0])
+        if cmd == "devices":
+            return emit({"ok": True, "devices": input_devices()})
+        if cmd == "reset":
+            return cmd_reset()
+        if cmd == "render":
+            settings = load_settings()
+            sys.stdout.write(render(settings, resolve_device(settings)))
+            return None
+        if cmd == "uninstall":
+            return cmd_uninstall()
+        if cmd == "calibrate" and rest == ["solve"]:
+            return cmd_calibrate_solve()
+        if cmd == "calibrate" and rest == ["apply"]:
+            return cmd_calibrate_apply()
+        if cmd == "calibrate" and rest == ["preview"]:
+            return cmd_calibrate_preview()
+        if cmd == "calibrate" and len(rest) == 2 and rest[0] == "play":
+            return cmd_calibrate_play(rest[1])
+        if cmd == "calibrate" and rest == ["clear"]:
+            return cmd_calibrate_clear()
+        if cmd == "calibrate" and len(rest) == 2:
+            return cmd_calibrate(rest[0], rest[1])
+    except OSError as e:
+        fail(str(e))
+    sys.stderr.write(__doc__)
+    sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

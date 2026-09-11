@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.codemonkey76.micfx",
+  "name": "Mic FX",
+  "version": "1.0.0",
+  "author": "Shane Poppleton",
+  "description": "Noise suppression, gate, compressor and limiter for your microphone, in every app",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Mic FX",
+    "description": "Noise suppression, gate, compressor and limiter for your microphone, with a setup wizard",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshSeconds": 10
+    },
+    "schema": [
+      {
+        "key": "refreshSeconds",
+        "type": "integer",
+        "label": "Refresh interval while closed (seconds)",
+        "min": 3,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 10
+      }
+    ]
+  }
+}
