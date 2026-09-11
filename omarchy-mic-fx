@@ -29,15 +29,21 @@ Files it writes are opened without following symlinks and replaced
 atomically, so a planted link can't redirect them. The wizard's talking and
 typing clips live only in the memory-backed runtime directory, for the
 preview, and are deleted when the wizard closes.
+
+Every program it runs is a checked absolute path in a system directory, never
+a name looked up through PATH, and starts in its own process group with a
+closed environment, under a deadline and a ceiling on what it may produce.
 """
 
 import array
+import atexit
 import io
 import json
 import math
 import os
 import re
 import secrets
+import select
 import signal
 import stat
 import subprocess
@@ -120,6 +126,127 @@ def lin(db):
 
 def to_db(value):
     return 20 * math.log10(value) if value > 0 else -120.0
+
+
+# ------------------------------------------------- programs and their children
+# Nothing here is looked up through PATH. Every program this helper runs is
+# found at a fixed absolute path in a system directory and checked before it
+# is used, so a `pactl` or `systemctl` planted earlier in a session's PATH is
+# never what gets run. Children start from a closed environment -- only the
+# handful of variables PipeWire, PulseAudio and `systemctl --user` need to
+# find this session -- in a process group of their own, so stopping one stops
+# everything it started rather than leaving a tree behind.
+
+TOOL_DIRS = ("/usr/bin", "/usr/local/bin", "/bin")
+# What the session needs to be findable; everything else is dropped.
+SESSION_ENV = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE",
+               "WAYLAND_DISPLAY", "DISPLAY", "PULSE_SERVER", "PULSE_COOKIE",
+               "PIPEWIRE_RUNTIME_DIR", "PIPEWIRE_REMOTE", "USER", "LOGNAME")
+MAX_OUTPUT = 4 << 20          # what one command may print before it is cut off
+GRACE = 2.0                   # how long a child has to stop before it is killed
+
+_tools = {}
+_children = []
+_children_lock = threading.Lock()
+
+
+def tool(name):
+    """The absolute path of a trusted system program, or None if there isn't one."""
+    if name not in _tools:
+        found = None
+        for directory in TOOL_DIRS:
+            path = os.path.join(directory, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            # A real program that only root can replace.
+            if stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022 and st.st_mode & 0o111:
+                found = path
+                break
+        _tools[name] = found
+    return _tools[name]
+
+
+def child_env():
+    return dict([("PATH", "/usr/bin:/bin"), ("HOME", HOME), ("LC_ALL", "C.UTF-8")] +
+                [(key, os.environ[key]) for key in SESSION_ENV if key in os.environ])
+
+
+def spawn(args, stdout=None, stdin=None):
+    """Start a trusted program in its own process group, or None if it won't start."""
+    path = tool(args[0])
+    if path is None:
+        return None
+    try:
+        proc = subprocess.Popen([path] + [str(a) for a in args[1:]],
+                                stdin=stdin,
+                                stdout=subprocess.DEVNULL if stdout is None else stdout,
+                                stderr=subprocess.DEVNULL,
+                                env=child_env(), close_fds=True, start_new_session=True)
+    except OSError:
+        return None
+    with _children_lock:
+        _children.append(proc)
+    return proc
+
+
+def signal_group(proc, number):
+    try:
+        os.killpg(os.getpgid(proc.pid), number)
+    except OSError:
+        try:
+            proc.send_signal(number)
+        except OSError:
+            pass
+
+
+def stop(proc, grace=GRACE):
+    """Stop a child and everything it started, then collect it."""
+    if proc is None:
+        return
+    if proc.poll() is None:
+        signal_group(proc, signal.SIGTERM)
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            signal_group(proc, signal.SIGKILL)
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
+    with _children_lock:
+        if proc in _children:
+            _children.remove(proc)
+
+
+# However this helper ends -- its own doing, or the widget asking it to stop --
+# nothing it started is left running.
+def stop_all(*_):
+    with _children_lock:
+        running = list(_children)
+    for proc in running:
+        stop(proc, grace=1.0)
+
+
+def on_signal(*_):
+    stop_all()
+    sys.exit(130)
+
+
+def supervise():
+    atexit.register(stop_all)
+    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(number, on_signal)
+        except (OSError, ValueError):
+            pass
 
 
 # ---------------------------------------------------------------- files
@@ -314,14 +441,61 @@ def controls(s):
 
 # ---------------------------------------------------------------- audio graph
 
-def run(args, timeout=10, check=False):
-    try:
-        done = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
+class Done:
+    """What a finished command said, in the shape subprocess.run returns."""
+    __slots__ = ("returncode", "stdout")
+
+    def __init__(self, returncode, stdout):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def drain(stream, limit, deadline):
+    """Read a pipe until it closes. Gives up rather than keep reading once the
+    output passes `limit` bytes or the clock passes `deadline`, so a command
+    that floods or hangs can't grow this process without bound."""
+    chunks, total = [], 0
+    fd = stream.fileno()
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        try:
+            ready = select.select([fd], [], [], min(left, 0.25))[0]
+        except OSError:
+            return None
+        if not ready:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            return None
+        if not chunk:
+            return b"".join(chunks).decode("utf-8", "replace")
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+
+
+def run(args, timeout=10, check=False, limit=MAX_OUTPUT):
+    """Run a trusted program to completion under an absolute deadline, reading
+    its output as it comes rather than buffering whatever it decides to say."""
+    proc = spawn(args, stdout=subprocess.PIPE)
+    if proc is None:
         return None
-    if check and done.returncode != 0:
+    deadline = time.monotonic() + timeout
+    out = drain(proc.stdout, limit, deadline)
+    if out is not None:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            out = None
+    code = proc.returncode
+    stop(proc)
+    if out is None or (check and code != 0):
         return None
-    return done
+    return Done(code, out)
 
 
 def sources():
@@ -416,18 +590,16 @@ def apply_live(values):
     node = capture_node_id()
     if node is None:
         return False
-    waker = subprocess.Popen(["parec", "-d", SOURCE, "--raw"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    waker = spawn(["parec", "-d", SOURCE, "--raw"])
+    if waker is None:
+        return False
     try:
         wait_for(lambda: source_state() == "RUNNING", 3)
         params = " ".join("%s %s" % (spa_string(k), repr(float(v))) for k, v in values.items())
         run(["pw-cli", "set-param", str(node), "Props", "{ params = [ %s ] }" % params])
         return wait_for(lambda: controls_match(node, values), 3)
     finally:
-        waker.terminate()
-        try:
-            waker.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            waker.kill()
+        stop(waker)
 
 
 def resolve_device(settings):
@@ -745,17 +917,24 @@ def record(device, seconds, on_level, keep=False, stats=None):
     levels = {"raw": [], "fx": []}
     clip = []
     peak = [0.0]      # the raw device's loudest sample, to catch clipping at the interface
+    # A phase lasts the seconds it was asked for, so each reader takes that
+    # much audio plus a little slack and then stops, whatever the device does.
+    ceiling = int((seconds + 2.0) * RATE) * 4
+    deadline = time.monotonic() + seconds + 10.0
     def reader(key, source):
-        p = subprocess.Popen(["parec", "-d", source, "--format=float32le", "--rate=%d" % RATE,
-                              "--channels=1", "--raw", "--latency-msec=50"],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        p = spawn(["parec", "-d", source, "--format=float32le", "--rate=%d" % RATE,
+                   "--channels=1", "--raw", "--latency-msec=50"], stdout=subprocess.PIPE)
+        if p is None:
+            return
         procs[key] = p
         need = WINDOW * 4
         buf = b""
-        while True:
+        taken = 0
+        while taken < ceiling and time.monotonic() < deadline:
             chunk = p.stdout.read(need - len(buf))
             if not chunk:
                 break
+            taken += len(chunk)
             buf += chunk
             if len(buf) == need:
                 a = array.array("f", buf)
@@ -769,18 +948,18 @@ def record(device, seconds, on_level, keep=False, stats=None):
                threading.Thread(target=reader, args=("fx", SOURCE), daemon=True)]
     for t in threads:
         t.start()
-    start = time.time()
+    start = time.monotonic()
     shown = 0
     try:
-        while time.time() - start < seconds:
+        while time.monotonic() - start < seconds and time.monotonic() < deadline:
             time.sleep(0.1)
             n = min(len(levels["raw"]), len(levels["fx"]))
             if n > shown:
-                on_level(levels["raw"][n - 1], levels["fx"][n - 1], time.time() - start)
+                on_level(levels["raw"][n - 1], levels["fx"][n - 1], time.monotonic() - start)
                 shown = n
     finally:
         for p in procs.values():
-            p.terminate()
+            stop(p)
         for t in threads:
             t.join(timeout=2)
     n = min(len(levels["raw"]), len(levels["fx"]))
@@ -982,21 +1161,16 @@ def read_clip(name):
 
 def feed(proc, pcm):
     # Writes block once pacat's buffer is full, so progress tracks playback.
+    # A player that goes away mid-clip ends the feed; it isn't an error.
     step = WINDOW * 2
-    for offset in range(0, len(pcm), step):
-        proc.stdin.write(pcm[offset:offset + step])
-        sys.stdout.write("progress %.3f\n" % min(1.0, (offset + step) / float(len(pcm))))
-        sys.stdout.flush()
-    proc.stdin.close()
-
-
-def stop(proc):
-    if proc and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+    try:
+        for offset in range(0, len(pcm), step):
+            proc.stdin.write(pcm[offset:offset + step])
+            sys.stdout.write("progress %.3f\n" % min(1.0, (offset + step) / float(len(pcm))))
+            sys.stdout.flush()
+        proc.stdin.close()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
 
 
 def suggested_settings():
@@ -1026,7 +1200,12 @@ def cmd_calibrate_preview():
     module = chain = recorder = player = None
     captured = []
     lead = 0
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))
+    # The preview is the clip's own length plus a little room for the chain to
+    # start and its tail to come through -- never more audio than that, and
+    # never longer than that, whatever the chain does.
+    clip_seconds = len(mix) / float(RATE)
+    ceiling = int((clip_seconds + 5.0) * RATE) * 4
+    deadline = time.monotonic() + clip_seconds + 60.0
     try:
         done = run(["pactl", "load-module", "module-null-sink", "sink_name=" + PREVIEW_SINK,
                     "sink_properties=device.description=Mic-FX-preview"])
@@ -1034,28 +1213,37 @@ def cmd_calibrate_preview():
         if not module:
             fail("couldn't create the preview's temporary sink")
         write_file(RUNTIME_DIR, "preview.conf", render(settings, PREVIEW_SINK, preview=True), 0o600)
-        chain = subprocess.Popen(["pipewire", "-c", os.path.join(RUNTIME_DIR, "preview.conf")],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        chain = spawn(["pipewire", "-c", os.path.join(RUNTIME_DIR, "preview.conf")])
+        if chain is None:
+            fail("couldn't start the preview chain")
         if not wait_for(lambda: source_present(PREVIEW_SOURCE), 8):
             fail("the preview chain didn't start")
-        recorder = subprocess.Popen(["parec", "-d", PREVIEW_SOURCE, "--format=float32le", "--rate=%d" % RATE,
-                                     "--channels=1", "--raw", "--latency-msec=50"],
-                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        recorder = spawn(["parec", "-d", PREVIEW_SOURCE, "--format=float32le", "--rate=%d" % RATE,
+                          "--channels=1", "--raw", "--latency-msec=50"], stdout=subprocess.PIPE)
+        if recorder is None:
+            fail("couldn't record the preview")
         def collect():
-            while True:
+            taken = 0
+            while taken < ceiling and time.monotonic() < deadline:
                 chunk = recorder.stdout.read(WINDOW * 4)
                 if not chunk:
                     break
+                taken += len(chunk)
                 captured.append(chunk)
         reader = threading.Thread(target=collect, daemon=True)
         reader.start()
         time.sleep(0.3)
         lead = sum(len(c) for c in captured) // 4      # samples recorded before the clip starts
-        player = subprocess.Popen(["pacat", "--playback", "-d", PREVIEW_SINK, "--format=s16le",
-                                   "--rate=%d" % RATE, "--channels=1", "--latency-msec=100"],
-                                  stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        player = spawn(["pacat", "--playback", "-d", PREVIEW_SINK, "--format=s16le",
+                        "--rate=%d" % RATE, "--channels=1", "--latency-msec=100"],
+                       stdin=subprocess.PIPE)
+        if player is None:
+            fail("couldn't play the clip through the preview chain")
         feed(player, pcm16(mix))
-        player.wait(timeout=60)
+        try:
+            player.wait(timeout=max(1.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            fail("the preview didn't finish in time")
         time.sleep(0.5)                                 # let the chain's tail through
         stop(recorder)
         reader.join(timeout=3)
@@ -1084,14 +1272,14 @@ def cmd_calibrate_play(which):
     if clip is None:
         fail("build the preview first")
     pcm = wav_frames(clip)
-    player = subprocess.Popen(["pacat", "--playback", "--format=s16le", "--rate=%d" % RATE, "--channels=1",
-                               "--latency-msec=100"], stdin=subprocess.PIPE,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))
+    player = spawn(["pacat", "--playback", "--format=s16le", "--rate=%d" % RATE, "--channels=1",
+                    "--latency-msec=100"], stdin=subprocess.PIPE)
+    if player is None:
+        fail("couldn't play the clip")
     try:
         feed(player, pcm)
-        player.wait(timeout=90)
-    except BrokenPipeError:
+        player.wait(timeout=len(pcm) / float(RATE * 2) + 30.0)
+    except subprocess.TimeoutExpired:
         pass
     finally:
         stop(player)
@@ -1107,6 +1295,7 @@ def cmd_calibrate_clear():
 # ---------------------------------------------------------------- main
 
 def main(argv):
+    supervise()
     if not argv or argv[0] == "status":
         return cmd_status()
     cmd, rest = argv[0], argv[1:]

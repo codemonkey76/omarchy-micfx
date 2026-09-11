@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import Quickshell
 import Quickshell.Io
 import qs.Ui
 import qs.Commons
@@ -14,11 +15,61 @@ Panel {
   // ---- Configuration ------------------------------------------------------
   // The helper is Python, bundled beside this file so the plugin is
   // self-contained, and run isolated (-I) so the environment can't change
-  // what it imports.
+  // what it imports. The interpreter is the system one by absolute path, not
+  // whichever `python3` a session's PATH happens to point at.
+  readonly property string python: "/usr/bin/python3"
   readonly property string cli: String(Qt.resolvedUrl("omarchy-mic-fx")).replace(/^file:\/\//, "")
   readonly property int refreshSeconds: Math.max(3, parseInt(setting("refreshSeconds", 10), 10) || 10)
 
-  function helper(args) { return ["python3", "-I", cli].concat(args) }
+  function helper(args) { return [python, "-I", cli].concat(args) }
+
+  // The helper starts from a closed environment: the little PipeWire,
+  // PulseAudio and `systemctl --user` need to find this session, and nothing
+  // else the shell happens to be carrying.
+  readonly property var helperEnv: {
+    var env = { "PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8" }
+    var pass = ["HOME", "USER", "LOGNAME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME",
+                "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE", "WAYLAND_DISPLAY", "DISPLAY",
+                "PULSE_SERVER", "PULSE_COOKIE", "PIPEWIRE_RUNTIME_DIR", "PIPEWIRE_REMOTE"]
+    for (var i = 0; i < pass.length; i++) {
+      var value = Quickshell.env(pass[i])
+      if (value !== null && value !== undefined && String(value) !== "") env[pass[i]] = String(value)
+    }
+    return env
+  }
+
+  // Every call to the helper is made through one of these: a closed
+  // environment, and a deadline past which it doesn't get to keep running.
+  component Helper: Process {
+    property int deadlineSeconds: 20
+    property real startedAt: 0
+    clearEnvironment: true
+    environment: fx.helperEnv
+    onRunningChanged: startedAt = running ? Date.now() : 0
+  }
+
+  readonly property var helpers: [statusProc, setProc, actionProc, calibProc,
+                                  solveProc, previewProc, playProc, clearProc]
+
+  // The watchdog. Anything past its deadline is asked to stop, and killed if
+  // it is still there five seconds later, so nothing this widget starts can
+  // run on indefinitely -- whether it wedged, or is just taking far longer
+  // than the work could possibly need.
+  Timer {
+    interval: 1000
+    repeat: true
+    running: true
+    onTriggered: {
+      var now = Date.now()
+      for (var i = 0; i < fx.helpers.length; i++) {
+        var p = fx.helpers[i]
+        if (!p.running || p.startedAt === 0) continue
+        var over = (now - p.startedAt) / 1000 - p.deadlineSeconds
+        if (over > 5) p.signal(9)
+        else if (over > 0) p.signal(15)
+      }
+    }
+  }
 
   // ---- State --------------------------------------------------------------
   property var status: null
@@ -91,8 +142,13 @@ Panel {
     messageTimer.restart()
   }
 
+  // A reply from the helper is one short line of JSON. Anything longer than
+  // that isn't a reply, and is dropped rather than parsed.
+  readonly property int maxReply: 1 << 20
   function parseLine(text) {
-    try { return JSON.parse(String(text || "").trim()) } catch (e) { return null }
+    var s = String(text || "")
+    if (s.length > maxReply) return null
+    try { return JSON.parse(s.trim()) } catch (e) { return null }
   }
 
   // ---- Reading ------------------------------------------------------------
@@ -102,13 +158,15 @@ Panel {
     statusProc.running = true
   }
 
-  Process {
+  // Read a line at a time rather than collecting everything the helper says:
+  // one reply is one line, so nothing is held on to waiting for the end.
+  Helper {
     id: statusProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var parsed = Model.parse(text)
-        if (!parsed) return
+    deadlineSeconds: 20
+    stdout: SplitParser {
+      onRead: function(line) {
+        var parsed = fx.parseLine(line)
+        if (!parsed || parsed.ok !== true) return
         fx.status = parsed
         fx.everLoaded = true
         if (!setProc.running && fx.queue.length === 0) fx.pending = ({})
@@ -155,13 +213,13 @@ Panel {
     setProc.running = true
   }
 
-  Process {
+  Helper {
     id: setProc
+    deadlineSeconds: 20
     property string key: ""
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var r = fx.parseLine(text)
+    stdout: SplitParser {
+      onRead: function(line) {
+        var r = fx.parseLine(line)
         if (r && r.ok === false) fx.flash(r.error || ("Couldn't change " + setProc.key), true)
       }
     }
@@ -181,13 +239,15 @@ Panel {
     actionProc.running = true
   }
 
-  Process {
+  // Turning the chain on or off waits on a systemd user service, so this one
+  // is given longer than a reply that only reads state.
+  Helper {
     id: actionProc
+    deadlineSeconds: 60
     property string doneText: ""
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var r = fx.parseLine(text)
+    stdout: SplitParser {
+      onRead: function(line) {
+        var r = fx.parseLine(line)
         if (r && r.ok === false) fx.flash(r.error || "That didn't work", true)
         else if (r && r.ok === true) fx.flash(actionProc.doneText, false)
       }
@@ -269,8 +329,9 @@ Panel {
     }
   }
 
-  Process {
+  Helper {
     id: calibProc
+    deadlineSeconds: 90
     property string phaseId: ""
     stdout: SplitParser {
       onRead: function(line) {
@@ -304,12 +365,12 @@ Panel {
     solveProc.running = true
   }
 
-  Process {
+  Helper {
     id: solveProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var r = fx.parseLine(text)
+    deadlineSeconds: 30
+    stdout: SplitParser {
+      onRead: function(line) {
+        var r = fx.parseLine(line)
         if (r && r.ok === true) {
           fx.solution = r
           fx.step = Model.PHASES.length
@@ -372,8 +433,9 @@ Panel {
     clearProc.running = true
   }
 
-  Process {
+  Helper {
     id: previewProc
+    deadlineSeconds: 180
     stdout: SplitParser {
       onRead: function(line) {
         var s = String(line)
@@ -397,8 +459,9 @@ Panel {
     }
   }
 
-  Process {
+  Helper {
     id: playProc
+    deadlineSeconds: 120
     stdout: SplitParser {
       onRead: function(line) {
         var s = String(line)
@@ -412,7 +475,7 @@ Panel {
     }
   }
 
-  Process { id: clearProc }
+  Helper { id: clearProc; deadlineSeconds: 15 }
 
   readonly property string primaryLabel: {
     if (step < 0) return running ? "Start" : "Turn on"

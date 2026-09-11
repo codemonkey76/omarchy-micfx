@@ -11,15 +11,6 @@ var ICON_PLAY = "󰐊"      // md-play
 var ICON_STOP = "󰓛"      // md-stop
 var ICON_HEADPHONES = "󰋋" // md-headphones
 
-function parse(text) {
-  try {
-    var parsed = JSON.parse(String(text || "").trim())
-    return parsed && parsed.ok === true ? parsed : null
-  } catch (e) {
-    return null
-  }
-}
-
 // The chain's stages in signal order: the switch that bypasses each, and its
 // sliders. Keys and ranges match the helper's SETTINGS table.
 var STAGES = [

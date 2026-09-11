@@ -169,6 +169,18 @@ preview clips are played from memory rather than re-opened by path. The only
 audio the wizard ever keeps is its clips, in the runtime directory, for as
 long as it's open.
 
+Nothing is run by name through `PATH`. The widget starts the bundled helper as
+`/usr/bin/python3`, and the helper finds `pactl`, `pw-cli`, `pw-dump`, `parec`,
+`pacat`, `pipewire` and `systemctl` at fixed absolute paths in system
+directories, using them only if they are real programs that no one but root can
+replace. Each one starts from a closed environment -- the handful of variables
+PipeWire, PulseAudio and `systemctl --user` need to find your session, and
+nothing else -- in a process group of its own, so stopping one stops everything
+it started. Output is read as it arrives against a size ceiling rather than
+buffered whole, recordings stop at a couple of seconds past the length asked
+for, and every call has a deadline the widget enforces: past it the helper is
+asked to stop, and killed if it hasn't gone five seconds later.
+
 ### Command line
 
 The helper works on its own too. It lives in the plugin directory,
