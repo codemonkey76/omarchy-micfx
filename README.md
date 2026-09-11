@@ -12,10 +12,12 @@ input that becomes your default:
 A setup wizard listens to your room, your voice and your typing, then suggests
 settings.
 
+![The Mic FX panel (left) and the setup wizard's suggested settings (right)](preview.png)
+
 ## What you get
 
-- **Bar icon** — a microphone, dimmed when Mic FX is off. Left click opens the
-  panel, right click switches it on or off, middle click refreshes.
+- **Bar icon** — a microphone, dimmed when Mic FX is off. Hovering shows its
+  state.
 - **Panel**
   - an on/off switch. On makes the processed mic your default input and moves
     apps that are already recording onto it. Off gives everything back to the
@@ -85,9 +87,59 @@ logout), and are deleted when the wizard closes, however it closes.
 omarchy plugin add https://github.com/codemonkey76/omarchy-micfx --enable
 ```
 
+Or by hand:
+
+```bash
+git clone https://github.com/codemonkey76/omarchy-micfx \
+  ~/.config/omarchy/plugins/io.github.codemonkey76.micfx
+```
+
 Then add `{ "id": "io.github.codemonkey76.micfx" }` to a bar section in
 `~/.config/omarchy/shell.json` if it isn't placed automatically, and run
 `omarchy restart shell`.
+
+## Configuration
+
+**There is nothing you have to configure.** Your processing settings are set
+from the panel (or the wizard) and saved for you.
+
+One optional setting, on the widget's entry in `~/.config/omarchy/shell.json`:
+
+```jsonc
+{
+  "id": "io.github.codemonkey76.micfx",
+  "refreshSeconds": 10
+}
+```
+
+`refreshSeconds` is how often the bar icon re-reads Mic FX's state while the
+panel is closed (default 10, minimum 3). While the panel is open it always
+polls every 3 seconds.
+
+## Usage
+
+| Action | Result |
+|---|---|
+| Left click | Open / close the panel |
+| Right click | Switch Mic FX on / off |
+| Middle click | Force a refresh |
+| `t` (panel open) | Switch Mic FX on / off |
+| `w` (panel open) | Open the setup wizard |
+| `r` (panel open) | Refresh |
+| `Esc` | Close the wizard if it's open, otherwise the panel |
+
+The letter keys do nothing while the wizard is open, so they can't fire while
+you're typing in step 3.
+
+### From scripts and keybindings
+
+```bash
+omarchy-shell io.github.codemonkey76.micfx toggle   # open/close the panel; also: open, close
+omarchy-shell io.github.codemonkey76.micfx enable   # also: disable
+omarchy-shell io.github.codemonkey76.micfx setup    # open the wizard
+omarchy-shell io.github.codemonkey76.micfx refresh
+omarchy-shell io.github.codemonkey76.micfx status   # one line, as in the tooltip
+```
 
 ## How it works
 
@@ -115,27 +167,24 @@ preview clips are played from memory rather than re-opened by path. The only
 audio the wizard ever keeps is its clips, in the runtime directory, for as
 long as it's open.
 
-The helper works on its own too:
+### Command line
+
+The helper works on its own too. It lives in the plugin directory,
+`~/.config/omarchy/plugins/io.github.codemonkey76.micfx/omarchy-mic-fx`:
 
 ```bash
 omarchy-mic-fx status             # JSON
 omarchy-mic-fx on                 # also: off, default
 omarchy-mic-fx set gate.threshold -48
+omarchy-mic-fx reset              # back to the default settings
 omarchy-mic-fx devices            # inputs it can process
 omarchy-mic-fx device <name>      # process a different one
 omarchy-mic-fx calibrate quiet 8  # also: speech, typing, solve, apply
 ```
 
-### From scripts and keybindings
+`omarchy-mic-fx --help` prints the full list.
 
-```bash
-omarchy-shell io.github.codemonkey76.micfx toggle   # open/close the panel
-omarchy-shell io.github.codemonkey76.micfx enable
-omarchy-shell io.github.codemonkey76.micfx disable
-omarchy-shell io.github.codemonkey76.micfx setup    # open the wizard
-```
-
-## Remove
+## Removal
 
 ```bash
 ~/.config/omarchy/plugins/io.github.codemonkey76.micfx/omarchy-mic-fx uninstall
@@ -144,4 +193,9 @@ rm -rf ~/.config/omarchy-mic-fx ~/.local/state/omarchy-mic-fx
 ```
 
 `uninstall` stops the service, gives the default input back to your mic, and
-removes the service and chain config.
+removes the service and chain config. Run it **before** removing the plugin,
+since it ships inside the plugin's directory.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
