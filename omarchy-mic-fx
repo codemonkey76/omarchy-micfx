@@ -30,9 +30,11 @@ atomically, so a planted link can't redirect them. The wizard's talking and
 typing clips live only in the memory-backed runtime directory, for the
 preview, and are deleted when the wizard closes.
 
-Every program it runs is a checked absolute path in a system directory, never
-a name looked up through PATH, and starts in its own process group with a
-closed environment, under a deadline and a ceiling on what it may produce.
+Every program it runs is found once in a system directory whose whole ancestry
+is root's own, then kept open and executed as that descriptor, so nothing is
+ever looked up through PATH or resolved again at exec time. Each starts in its
+own process group with a closed environment, under a deadline and a ceiling on
+what it may produce.
 """
 
 import array
@@ -129,41 +131,132 @@ def to_db(value):
 
 
 # ------------------------------------------------- programs and their children
-# Nothing here is looked up through PATH. Every program this helper runs is
-# found at a fixed absolute path in a system directory and checked before it
-# is used, so a `pactl` or `systemctl` planted earlier in a session's PATH is
-# never what gets run. Children start from a closed environment -- only the
-# handful of variables PipeWire, PulseAudio and `systemctl --user` need to
-# find this session -- in a process group of their own, so stopping one stops
-# everything it started rather than leaving a tree behind.
+# Nothing here is looked up through PATH, and nothing is resolved twice. Every
+# program this helper runs is found once, in a system directory opened one
+# component at a time from / and checked the whole way down, and then *kept
+# open*: what is executed is the descriptor that was checked, named to execve
+# as /proc/self/fd/N, which is what fexecve does. There is no window in which a
+# directory entry could be swapped between the check and the exec, and nothing
+# a non-root user can write is ever a candidate. Children start from a closed
+# environment -- only the handful of variables PipeWire, PulseAudio and
+# `systemctl --user` need to find this session -- in a process group of their
+# own, so stopping one stops everything it started rather than leaving a tree
+# behind.
 
-TOOL_DIRS = ("/usr/bin", "/usr/local/bin", "/bin")
+# Only the two distribution directories, which are the same directory on
+# Omarchy (/bin is root's own symlink to usr/bin). /usr/local/bin is left out
+# deliberately: every program used here ships with PipeWire, PulseAudio or
+# systemd, so there is nothing to gain from trusting the directory a local
+# build lands in.
+TOOL_DIRS = ("/usr/bin", "/bin")
 # What the session needs to be findable; everything else is dropped.
 SESSION_ENV = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE",
                "WAYLAND_DISPLAY", "DISPLAY", "PULSE_SERVER", "PULSE_COOKIE",
                "PIPEWIRE_RUNTIME_DIR", "PIPEWIRE_REMOTE", "USER", "LOGNAME")
 MAX_OUTPUT = 4 << 20          # what one command may print before it is cut off
 GRACE = 2.0                   # how long a child has to stop before it is killed
+LINK_HOPS = 8                 # how far a chain of root's own symlinks may go
 
 _tools = {}
+_tool_dirs = None
 _children = []
 _children_lock = threading.Lock()
 
 
+def root_owned_dir(fd):
+    """True if an open descriptor is a directory only root can write."""
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022
+
+
+def system_dir(path):
+    """A descriptor for a system directory, or None unless every directory on
+    the way to it -- / included -- is root's own and writable by nobody else."""
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        if not root_owned_dir(fd):
+            return None
+        for name in [p for p in path.split("/") if p]:
+            if name in (".", ".."):
+                return None
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            # /bin -> usr/bin is root's own link, and followed; anyone else's
+            # is not, and a real directory is opened without following at all.
+            if stat.S_ISLNK(st.st_mode):
+                if st.st_uid != 0:
+                    return None
+            else:
+                flags |= os.O_NOFOLLOW
+            child = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            if not root_owned_dir(fd):
+                return None
+        keep, fd = fd, None
+        return keep
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def system_dirs():
+    global _tool_dirs
+    if _tool_dirs is None:
+        _tool_dirs = [fd for fd in [system_dir(p) for p in TOOL_DIRS] if fd is not None]
+    return _tool_dirs
+
+
+def open_program(dir_fd, name):
+    """A descriptor for a program inside an already-checked directory, or None.
+    The file itself is opened without following symlinks; a link root wrote --
+    /usr/bin/parec -> pacat, say -- is resolved by hand, a plain name at a
+    time, inside that same directory, so resolution can never leave it."""
+    for _ in range(LINK_HOPS):
+        try:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            if st.st_uid != 0:
+                return None
+            try:
+                target = os.readlink(name, dir_fd=dir_fd)
+            except OSError:
+                return None
+            if "/" in target or target in ("", ".", ".."):
+                return None
+            name = target
+            continue
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        except OSError:
+            return None
+        # A real program, root's own, that only root can replace. Checked on
+        # the descriptor, which is also the thing that gets executed.
+        st = os.fstat(fd)
+        if (stat.S_ISREG(st.st_mode) and st.st_uid == 0
+                and not st.st_mode & 0o022 and st.st_mode & 0o111):
+            return fd
+        os.close(fd)
+        return None
+    return None
+
+
 def tool(name):
-    """The absolute path of a trusted system program, or None if there isn't one."""
+    """An open descriptor for a trusted system program, or None if there isn't one."""
     if name not in _tools:
         found = None
-        for directory in TOOL_DIRS:
-            path = os.path.join(directory, name)
-            try:
-                st = os.stat(path)
-            except OSError:
-                continue
-            # A real program that only root can replace.
-            if stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022 and st.st_mode & 0o111:
-                found = path
-                break
+        if name and "/" not in name and name not in (".", ".."):
+            for dir_fd in system_dirs():
+                found = open_program(dir_fd, name)
+                if found is not None:
+                    break
         _tools[name] = found
     return _tools[name]
 
@@ -174,12 +267,20 @@ def child_env():
 
 
 def spawn(args, stdout=None, stdin=None):
-    """Start a trusted program in its own process group, or None if it won't start."""
-    path = tool(args[0])
-    if path is None:
+    """Start a trusted program in its own process group, or None if it won't
+    start. The descriptor found by `tool` is what runs: naming it through
+    /proc/self/fd leaves the kernel nothing to resolve. argv[0] stays the name
+    that was asked for, which pacat reads to tell recording from playback."""
+    fd = tool(args[0])
+    if fd is None:
         return None
     try:
-        proc = subprocess.Popen([path] + [str(a) for a in args[1:]],
+        proc = subprocess.Popen([str(a) for a in args],
+                                executable="/proc/self/fd/%d" % fd,
+                                # The one descriptor the child keeps: read-only,
+                                # on the program it is itself running. Everything
+                                # else of ours is closed before it starts.
+                                pass_fds=(fd,),
                                 stdin=stdin,
                                 stdout=subprocess.DEVNULL if stdout is None else stdout,
                                 stderr=subprocess.DEVNULL,
