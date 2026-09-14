@@ -24,7 +24,10 @@ settings.
     raw mic.
   - a microphone picker, for when you have more than one. Switching restarts
     the chain on the new mic, and Mic FX stays your default input if it was.
-  - one section per stage, each with its own switch and sliders. Changes apply
+  - one line per stage, with its own switch and a summary of what it's doing
+    (`−50 dB`, `nasal −5 dB @ 1.1 kHz`). Click a stage to open its everyday
+    sliders; **More** shows the rest (attack, release, frequencies and
+    widths). Stages start closed each time the panel opens. Changes apply
     live, without interrupting a call.
   - **Setup wizard**: three short recordings (quiet, talking, typing) with live
     before/after level meters. It then shows what it measured and the settings

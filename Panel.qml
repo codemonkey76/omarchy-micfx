@@ -81,6 +81,12 @@ Panel {
   property string busyAction: ""
   property string message: ""
   property bool messageIsError: false
+  // Which stages are open, and which show their advanced controls. Everything
+  // starts closed each time the panel opens.
+  property var openStages: ({})
+  property var moreStages: ({})
+
+  function flip(map, id) { return withKey(map, id, map[id] !== true) }
 
   // Not "settings": the Panel base already uses that name for this widget's
   // own shell.json options, which setting() reads.
@@ -509,7 +515,7 @@ Panel {
     closeWizard()
   }
 
-  onOpenedChanged: if (opened) refresh()
+  onOpenedChanged: if (opened) { openStages = ({}); moreStages = ({}); refresh() }
   // Leaving the typing step hands the keyboard back to the panel, so Escape
   // and Tab work again.
   onStepChanged: if (!(phase && phase.typing === true) && typingField.activeFocus) keyCatcher.forceActiveFocus()
@@ -555,7 +561,7 @@ Panel {
     open: fx.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    // Tall enough for every stage at once; only scrolls if the screen is shorter.
+    // Grows as stages open; only scrolls if the screen is shorter.
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
@@ -1160,21 +1166,59 @@ Panel {
     property var spec: null
     readonly property string toggleKey: spec && spec.toggle ? spec.toggle : ""
     readonly property bool on: toggleKey === "" || fx.value(toggleKey, true) === true
+    readonly property string stageId: spec ? spec.id : ""
+    readonly property bool expanded: fx.openStages[stageId] === true
+    readonly property bool more: fx.moreStages[stageId] === true
+    readonly property bool hasMore: Model.hasAdvanced(spec)
     spacing: Style.space(8)
 
     PanelSeparator { foreground: fx.fg }
 
+    // The whole row opens and closes the stage, except its switch.
     Item {
       width: parent.width
       implicitHeight: Math.max(stageHeader.implicitHeight, stageSwitch.visible ? stageSwitch.implicitHeight : 0)
 
+      MouseArea {
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        onClicked: fx.openStages = fx.flip(fx.openStages, stage.stageId)
+      }
+
+      Text {
+        id: chevron
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        width: Style.space(16)
+        text: stage.expanded ? "󰅀" : "󰅂"     // md-chevron_down / md-chevron_right
+        textFormat: Text.PlainText
+        color: fx.dim
+        font.family: fx.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
       PanelSectionHeader {
         id: stageHeader
-        anchors.left: parent.left
+        anchors.left: chevron.right
         anchors.verticalCenter: parent.verticalCenter
         text: stage.spec ? stage.spec.title : ""
         foreground: fx.fg
         fontFamily: fx.fontFamily
+      }
+
+      Text {
+        anchors.left: stageHeader.right
+        anchors.leftMargin: Style.space(10)
+        anchors.right: stageSwitch.visible ? stageSwitch.left : parent.right
+        anchors.rightMargin: Style.space(10)
+        anchors.verticalCenter: parent.verticalCenter
+        horizontalAlignment: Text.AlignRight
+        text: Model.stageSummary(stage.spec, function(k) { return fx.value(k, undefined) })
+        textFormat: Text.PlainText
+        elide: Text.ElideRight
+        color: fx.dim
+        font.family: fx.fontFamily
+        font.pixelSize: Style.font.bodySmall
       }
 
       ToggleSwitch {
@@ -1192,9 +1236,25 @@ Panel {
       model: stage.spec ? stage.spec.controls : []
       SliderRow {
         required property var modelData
+        visible: stage.expanded && (modelData.advanced !== true || stage.more)
         width: stage.width
         spec: modelData
         opacity: stage.on ? 1.0 : 0.45
+      }
+    }
+
+    Text {
+      visible: stage.expanded && stage.hasMore
+      text: stage.more ? "Less 󰅃" : "More 󰅀"   // md-chevron_up / md-chevron_down
+      textFormat: Text.PlainText
+      color: fx.dim
+      font.family: fx.fontFamily
+      font.pixelSize: Style.font.bodySmall
+
+      MouseArea {
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        onClicked: fx.moreStages = fx.flip(fx.moreStages, stage.stageId)
       }
     }
   }
