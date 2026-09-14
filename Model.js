@@ -26,6 +26,17 @@ var STAGES = [
     { key: "gate.range", label: "Range", unit: "dB", min: -80, max: 0, step: 1 },
     { key: "gate.hold", label: "Hold", unit: "ms", min: 0, max: 500, step: 5 },
     { key: "gate.release", label: "Release", unit: "ms", min: 5, max: 1000, step: 5 } ] },
+  { title: "TONE", toggle: "tone.enabled", controls: [
+    { key: "tone.nasal.cut", label: "Nasal cut", unit: "dB", min: -12, max: 0, step: 0.5 },
+    { key: "tone.nasal.freq", label: "Nasal frequency", unit: "Hz", min: 600, max: 2000, step: 10 },
+    { key: "tone.nasal.q", label: "Nasal width (Q)", unit: "", min: 0.5, max: 10, step: 0.1 },
+    { key: "tone.box.cut", label: "Boxiness cut", unit: "dB", min: -12, max: 0, step: 0.5 },
+    { key: "tone.box.freq", label: "Boxiness frequency", unit: "Hz", min: 200, max: 800, step: 10 },
+    { key: "tone.box.q", label: "Boxiness width (Q)", unit: "", min: 0.5, max: 10, step: 0.1 },
+    { key: "tone.presence.gain", label: "Presence", unit: "dB", min: -6, max: 6, step: 0.5 },
+    { key: "tone.presence.freq", label: "Presence frequency", unit: "Hz", min: 2000, max: 6000, step: 100 },
+    { key: "tone.air.gain", label: "Air", unit: "dB", min: -6, max: 6, step: 0.5 },
+    { key: "tone.air.freq", label: "Air frequency", unit: "Hz", min: 6000, max: 16000, step: 250 } ] },
   { title: "COMPRESSOR", toggle: "comp.enabled", controls: [
     { key: "comp.threshold", label: "Threshold", unit: "dB", min: -60, max: 0, step: 0.5 },
     { key: "comp.ratio", label: "Ratio", unit: ":1", min: 1, max: 20, step: 0.5 },
@@ -84,6 +95,7 @@ function formatValue(value, unit) {
   var whole = unit === "%" || unit === "ms" || unit === "Hz" || Math.abs(n) >= 100
   var text = whole ? String(Math.round(n)) : n.toFixed(1).replace(/\.0$/, "")
   if (unit === ":1") return text + ":1"
+  if (unit === "") return text
   if (unit === "dB" && n > 0) text = "+" + text
   return unit === "%" ? text + "%" : text + " " + unit
 }

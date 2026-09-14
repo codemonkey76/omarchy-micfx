@@ -2,7 +2,7 @@
 """omarchy-mic-fx: the helper behind the io.github.codemonkey76.micfx Omarchy widget.
 
 Puts a processed copy of a microphone in front of it -- input gain, high-pass,
-RNNoise noise suppression, gate, compressor, limiter -- as a virtual source
+RNNoise noise suppression, gate, tone, compressor, limiter -- as a virtual source
 that every app (Zoom, Teams, browsers) can record from. The chain is a
 PipeWire filter-chain hosted by its own PipeWire client under a systemd user
 service, the way Omarchy hosts its speaker tuning, so switching it on and off
@@ -97,6 +97,22 @@ SETTINGS = {
     "gate.attack":       (5.0,     0.0, 100.0),
     "gate.hold":         (100.0,   0.0, 500.0),
     "gate.release":      (150.0,   5.0, 1000.0),
+    # Tone: corrective cuts first -- a narrow bell for the nasal "honk"
+    # (800 Hz - 1.5 kHz) and a milder one for boxiness (300 - 500 Hz) -- then
+    # gentle boosts for presence (3 - 5 kHz) and air (a shelf above 8 kHz).
+    # PipeWire's own biquads, so nothing to install. Off by default, and flat
+    # until changed.
+    "tone.enabled":       (False, None,    None),
+    "tone.nasal.cut":     (-4.0,   -12.0,  0.0),
+    "tone.nasal.freq":    (1000.0,  600.0, 2000.0),
+    "tone.nasal.q":       (4.0,      0.5,  10.0),
+    "tone.box.cut":       (0.0,    -12.0,  0.0),
+    "tone.box.freq":      (400.0,   200.0, 800.0),
+    "tone.box.q":         (1.4,      0.5,  10.0),
+    "tone.presence.gain": (0.0,     -6.0,  6.0),
+    "tone.presence.freq": (4000.0, 2000.0, 6000.0),
+    "tone.air.gain":      (0.0,     -6.0,  6.0),
+    "tone.air.freq":      (10000.0, 6000.0, 16000.0),
     "comp.enabled":      (True,  None,  None),
     "comp.threshold":    (-30.0, -60.0, 0.0),
     "comp.ratio":        (3.0,     1.0, 20.0),
@@ -521,6 +537,20 @@ def controls(s):
         "gate:hold": s["gate.hold"],
         "gate:rt": s["gate.release"],
         "gate:mk": 1.0,
+        # Bypassed as flat filters rather than unlinked, so switching tone on
+        # and off is a live change, not a restart.
+        "box:Freq": s["tone.box.freq"],
+        "box:Q": s["tone.box.q"],
+        "box:Gain": s["tone.box.cut"] if s["tone.enabled"] else 0.0,
+        "nasal:Freq": s["tone.nasal.freq"],
+        "nasal:Q": s["tone.nasal.q"],
+        "nasal:Gain": s["tone.nasal.cut"] if s["tone.enabled"] else 0.0,
+        "presence:Freq": s["tone.presence.freq"],
+        "presence:Q": 1.0,
+        "presence:Gain": s["tone.presence.gain"] if s["tone.enabled"] else 0.0,
+        "air:Freq": s["tone.air.freq"],
+        "air:Q": 0.707,
+        "air:Gain": s["tone.air.gain"] if s["tone.enabled"] else 0.0,
         "comp:enabled": 1.0 if s["comp.enabled"] else 0.0,
         "comp:cm": 0.0,
         "comp:al": lin(s["comp.threshold"]),
@@ -754,6 +784,10 @@ context.modules = [
           {{ type = builtin name = hp label = bq_highpass control = {hp} }}
           {{ type = ladspa name = rnnoise plugin = "librnnoise_ladspa" label = noise_suppressor_mono control = {rnnoise} }}
           {{ type = lv2 name = gate plugin = "{lsp}gate_mono" control = {gate} }}
+          {{ type = builtin name = box label = bq_peaking control = {box} }}
+          {{ type = builtin name = nasal label = bq_peaking control = {nasal} }}
+          {{ type = builtin name = presence label = bq_peaking control = {presence} }}
+          {{ type = builtin name = air label = bq_highshelf control = {air} }}
           {{ type = lv2 name = comp plugin = "{lsp}compressor_mono" control = {comp} }}
           {{ type = lv2 name = limit plugin = "{lsp}limiter_mono" control = {limit} }}
         ]
@@ -761,7 +795,11 @@ context.modules = [
           {{ output = "pre:Out"        input = "hp:In" }}
           {{ output = "hp:Out"         input = "rnnoise:Input" }}
           {{ output = "rnnoise:Output" input = "gate:in" }}
-          {{ output = "gate:out"       input = "comp:in" }}
+          {{ output = "gate:out"       input = "box:In" }}
+          {{ output = "box:Out"        input = "nasal:In" }}
+          {{ output = "nasal:Out"      input = "presence:In" }}
+          {{ output = "presence:Out"   input = "air:In" }}
+          {{ output = "air:Out"        input = "comp:in" }}
           {{ output = "comp:out"       input = "limit:in" }}
         ]
         inputs  = [ "pre:In 1" ]
@@ -786,7 +824,7 @@ context.modules = [
   }}
 ]
 """.format(label=label, pre=block("pre"), hp=block("hp"), rnnoise=block("rnnoise"), gate=block("gate"),
-           comp=block("comp"), limit=block("limit"), lsp=LSP_URI,
+           box=block("box"), nasal=block("nasal"), presence=block("presence"), air=block("air"), comp=block("comp"), limit=block("limit"), lsp=LSP_URI,
            capture=PREVIEW_CAPTURE if preview else CAPTURE, source=PREVIEW_SOURCE if preview else SOURCE,
            passive="false" if preview else "true",
            capture_sink="\n        stream.capture.sink = true" if preview else "",
@@ -956,10 +994,11 @@ def cmd_set(key, value):
         fail(str(e))
     save_settings(settings)
     stage = key.split(".")[0]
-    prefix = {"gain": "pre", "hpf": "hp", "suppress": "rnnoise", "gate": "gate", "comp": "comp", "limit": "limit"}[stage]
+    prefixes = {"gain": ("pre",), "hpf": ("hp",), "suppress": ("rnnoise",), "gate": ("gate",),
+                "tone": ("box", "nasal", "presence", "air"), "comp": ("comp",), "limit": ("limit",)}[stage]
     live = False
     if source_present(SOURCE):
-        live = apply_live({k: v for k, v in controls(settings).items() if k.startswith(prefix + ":")})
+        live = apply_live({k: v for k, v in controls(settings).items() if k.split(":", 1)[0] in prefixes})
         write_file(PIPEWIRE_DIR, HOST_CONF, render(settings, resolve_device(settings)), 0o644)
     emit({"ok": True, "key": key, "value": settings[key], "live": live})
 

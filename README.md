@@ -7,7 +7,7 @@ needed.
 It puts a processed copy of your mic in front of the real one, as a virtual
 input that becomes your default:
 
-**input gain → high-pass → RNNoise noise suppression → noise gate → compressor → limiter**
+**input gain → high-pass → RNNoise noise suppression → noise gate → tone → compressor → limiter**
 
 A setup wizard listens to your room, your voice and your typing, then suggests
 settings.
@@ -31,6 +31,40 @@ settings.
     it suggests, as a list of *current → suggested*, and lets you hear your
     typing over your talking before and after, so you can decide by ear.
 - Everything runs locally. No audio leaves your machine.
+
+## Tone: if you sound nasal or boxy
+
+**TONE** is a small EQ, off until you switch it on. It uses PipeWire's own
+filters, so there's nothing extra to install. Cut first, then boost:
+
+| Control | What it does | Start with |
+|---|---|---|
+| **Nasal cut** | a narrow bell where a voice sounds honky, "in your nose" | −3 to −6 dB |
+| **Nasal frequency** | where it sits, usually 800 Hz – 1.5 kHz | 1 kHz |
+| **Nasal width (Q)** | higher is narrower. Sweep narrow (4–8), settle wider if it sounds better | 4 |
+| **Boxiness cut** | a milder bell for boxy, muddy-nasal tone | 0 to −3 dB |
+| **Boxiness frequency** | usually 300 – 500 Hz | 400 Hz |
+| **Presence** | a gentle bell boost for clarity | 0 to +2 dB |
+| **Presence frequency** | usually 3 – 5 kHz | 4 kHz |
+| **Air** | a shelf boost that offsets the darker tone a cut can leave | 0 to +2 dB |
+| **Air frequency** | where the shelf starts, usually 8 – 10 kHz | 10 kHz |
+
+To find your nasal frequency, listen to yourself through Mic FX, **with
+headphones on** (on speakers it howls):
+
+```bash
+pw-loopback -C omarchy_mic_fx -m '[ MONO ]'    # Ctrl+C to stop
+```
+
+Set **Nasal cut** to −9 dB and **Width** to 6, sweep **Nasal frequency** slowly
+from 800 Hz to 1.5 kHz while you talk, and stop where the honk goes away. Then
+ease the cut back to −3 to −6 dB: more than that sounds muffled. Do the same
+for boxiness between 300 and 500 Hz if you hear it. Only then add presence or
+air.
+
+Tone comes after the gate, so the gate still judges your natural voice, and
+before the compressor and limiter, so they don't react to the resonance you're
+cutting.
 
 ## The wizard
 
@@ -195,6 +229,8 @@ The helper works on its own too. It lives in the plugin directory,
 omarchy-mic-fx status             # JSON
 omarchy-mic-fx on                 # also: off, default
 omarchy-mic-fx set gate.threshold -48
+omarchy-mic-fx set tone.enabled on
+omarchy-mic-fx set tone.nasal.cut -5
 omarchy-mic-fx reset              # back to the default settings
 omarchy-mic-fx devices            # inputs it can process
 omarchy-mic-fx device <name>      # process a different one
