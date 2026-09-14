@@ -24,6 +24,11 @@ settings.
     raw mic.
   - a microphone picker, for when you have more than one. Switching restarts
     the chain on the new mic, and Mic FX stays your default input if it was.
+  - **Sample**: record ten seconds of your raw mic, then loop it through your
+    settings while you adjust them, and flip to the original to compare. It
+    plays through a private copy of the chain on your default output, so
+    calls using Mic FX aren't touched. The loop stops when the panel closes,
+    and the recording lives in your runtime directory like the wizard's clips.
   - one line per stage, with its own switch and a summary of what it's doing
     (`−50 dB`, `nasal −5 dB @ 1.1 kHz`). Click a stage to open its everyday
     sliders; **More** shows the rest (attack, release, frequencies and
@@ -52,12 +57,12 @@ filters, so there's nothing extra to install. Cut first, then boost:
 | **Air** | a shelf boost that offsets the darker tone a cut can leave | 0 to +2 dB |
 | **Air frequency** | where the shelf starts, usually 8 – 10 kHz | 10 kHz |
 
-To find your nasal frequency, listen to yourself through Mic FX, **with
-headphones on** (on speakers it howls):
-
-```bash
-pw-loopback -C omarchy_mic_fx -m '[ MONO ]'    # Ctrl+C to stop
-```
+To find your nasal frequency, use **SAMPLE** in the panel, with headphones on:
+**Record** ten seconds of yourself talking, then **Loop** it. Everything you
+change applies to the loop straight away, and **Original** / **With settings**
+flip between the recording as it was and through your settings. Listening to a
+recording works far better than listening to yourself live, where the sound of
+your own voice in your head drowns out small changes.
 
 Set **Nasal cut** to −9 dB and **Width** to 6, sweep **Nasal frequency** slowly
 from 800 Hz to 1.5 kHz while you talk, and stop where the honk goes away. Then
@@ -193,7 +198,7 @@ restarts the audio daemon or disconnects other apps.
 | `~/.config/pipewire/omarchy-mic-fx.conf` | the generated chain (rewritten on every change) |
 | `~/.config/systemd/user/omarchy-mic-fx.service` | the service that hosts it |
 | `~/.local/state/omarchy-mic-fx/` | the previous default input, and the wizard's measurements (per-100 ms levels, no audio) |
-| `$XDG_RUNTIME_DIR/omarchy-mic-fx/` | the wizard's talking and typing clips and their preview, only while the wizard is open |
+| `$XDG_RUNTIME_DIR/omarchy-mic-fx/` | the wizard's talking and typing clips and their preview, only while the wizard is open; your sample, until logout or a new one |
 
 Settings change live through `pw-cli set-param`, and are read back from
 PipeWire before the widget reports them applied. The chain is a plain
@@ -238,6 +243,7 @@ omarchy-mic-fx reset              # back to the default settings
 omarchy-mic-fx devices            # inputs it can process
 omarchy-mic-fx device <name>      # process a different one
 omarchy-mic-fx calibrate quiet 8  # also: speech, typing, solve, apply
+omarchy-mic-fx sample record 10   # then: sample play processed (or original), sample clear
 ```
 
 `omarchy-mic-fx --help` prints the full list.

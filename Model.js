@@ -10,6 +10,8 @@ var ICON_RESTORE = "󰦛"   // md-restore
 var ICON_PLAY = "󰐊"      // md-play
 var ICON_STOP = "󰓛"      // md-stop
 var ICON_HEADPHONES = "󰋋" // md-headphones
+var ICON_RECORD = "󰑊"     // md-record_rec
+var ICON_LOOP = "󰑖"       // md-repeat
 
 // The chain's stages in signal order: the switch that bypasses each, and its
 // sliders. Keys and ranges match the helper's SETTINGS table. A stage opens to

@@ -24,6 +24,9 @@ never restarts the audio daemon.
   omarchy-mic-fx calibrate preview       mix the typing over the talking, before and after the chain
   omarchy-mic-fx calibrate play WHICH    play that preview: before or after
   omarchy-mic-fx calibrate clear         delete the wizard's audio clips
+  omarchy-mic-fx sample record SECS      record a short sample of the raw mic
+  omarchy-mic-fx sample play MODE        loop it, processed or original, until stopped
+  omarchy-mic-fx sample clear            delete the sample
 
 Files it writes are opened without following symlinks and replaced
 atomically, so a planted link can't redirect them. The wizard's talking and
@@ -73,6 +76,15 @@ RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or STATE_HOME, NAME
 PREVIEW_SINK = "omarchy_mic_fx_preview_in"
 PREVIEW_SOURCE = "omarchy_mic_fx_preview"
 PREVIEW_CAPTURE = "omarchy_mic_fx_preview.capture"
+# The sample loop: a recording of the raw mic, played on repeat through its own
+# copy of the chain -- fed from a temporary sink, playing to your default
+# output -- which follows every setting change, so you can tune by ear
+# without your own voice in the way.
+SAMPLE_SINK = "omarchy_mic_fx_sample_in"
+SAMPLE_CAPTURE = "omarchy_mic_fx_sample.capture"
+SAMPLE_PLAYBACK = "omarchy_mic_fx_sample"
+SAMPLE_MAX_SECONDS = 30.0
+SAMPLE_LOOP_LIMIT = 30 * 60               # a forgotten loop stops by itself
 PIPEWIRE_DIR = os.path.join(CONFIG_HOME, "pipewire")
 UNIT_DIR = os.path.join(CONFIG_HOME, "systemd", "user")
 
@@ -663,18 +675,22 @@ def source_present(name):
     return any(src.get("name") == name for src in sources())
 
 
-def capture_node_id():
+def node_id(name):
     done = run(["pw-dump"], timeout=10)
     if not done or done.returncode != 0:
         return None
     try:
         for obj in json.loads(done.stdout):
             props = (obj.get("info") or {}).get("props") or {}
-            if obj.get("type") == "PipeWire:Interface:Node" and props.get("node.name") == CAPTURE:
+            if obj.get("type") == "PipeWire:Interface:Node" and props.get("node.name") == name:
                 return obj.get("id")
     except ValueError:
         pass
     return None
+
+
+def capture_node_id():
+    return node_id(CAPTURE)
 
 
 # Device descriptions come from the hardware (a USB device names itself), so
@@ -733,6 +749,17 @@ def apply_live(values):
         stop(waker)
 
 
+# The sample loop's chain is playing whenever it exists, so it takes changes
+# straight away. Nothing is waiting on it, so it isn't read back.
+def apply_to_sample(values):
+    node = node_id(SAMPLE_CAPTURE)
+    if node is None:
+        return False
+    params = " ".join("%s %s" % (spa_string(k), repr(float(v))) for k, v in values.items())
+    done = run(["pw-cli", "set-param", str(node), "Props", "{ params = [ %s ] }" % params])
+    return bool(done) and done.returncode == 0
+
+
 def resolve_device(settings):
     if settings["device"]:
         return settings["device"]
@@ -752,13 +779,13 @@ def describe(device):
 
 # With preview, the chain is a throwaway copy that captures a temporary sink
 # instead of a microphone, under its own node names.
-def render(settings, device, preview=False):
+def render(settings, device, preview=False, sample=False):
     c = controls(settings)
     fmt = lambda v: ("%.6f" % v).rstrip("0").rstrip(".") if isinstance(v, float) else str(v)
     def block(prefix):
         items = ["%s = %s" % (spa_string(k.split(":", 1)[1]), fmt(v)) for k, v in c.items() if k.startswith(prefix + ":")]
         return "{ " + " ".join(items) + " }"
-    label = spa_string("Mic FX preview" if preview else describe(device) + " (Mic FX)")
+    label = spa_string("Mic FX sample" if sample else "Mic FX preview" if preview else describe(device) + " (Mic FX)")
     return """# Written by omarchy-mic-fx. Changes here are overwritten; use the widget or
 # `omarchy-mic-fx set` instead.
 
@@ -817,17 +844,19 @@ context.modules = [
         node.dont-move     = true
       }}
       playback.props = {{
-        node.name   = "{source}"
-        media.class = Audio/Source
+        node.name   = "{source}"{playback_class}
       }}
     }}
   }}
 ]
 """.format(label=label, pre=block("pre"), hp=block("hp"), rnnoise=block("rnnoise"), gate=block("gate"),
            box=block("box"), nasal=block("nasal"), presence=block("presence"), air=block("air"), comp=block("comp"), limit=block("limit"), lsp=LSP_URI,
-           capture=PREVIEW_CAPTURE if preview else CAPTURE, source=PREVIEW_SOURCE if preview else SOURCE,
-           passive="false" if preview else "true",
-           capture_sink="\n        stream.capture.sink = true" if preview else "",
+           capture=SAMPLE_CAPTURE if sample else PREVIEW_CAPTURE if preview else CAPTURE,
+           source=SAMPLE_PLAYBACK if sample else PREVIEW_SOURCE if preview else SOURCE,
+           # The sample chain plays to your default output; the others are sources.
+           playback_class="" if sample else "\n        media.class = Audio/Source",
+           passive="false" if (preview or sample) else "true",
+           capture_sink="\n        stream.capture.sink = true" if (preview or sample) else "",
            device=spa_string(device))
 
 
@@ -928,6 +957,7 @@ def cmd_status():
         "devices": input_devices(),
         "settings": {k: settings[k] for k in SETTINGS},
         "calibration": {"phases": calib, "suggestion": read_json(CALIBRATION_DIR, "suggestion.json", None)},
+        "sample": sample_info(),
     })
 
 
@@ -997,10 +1027,12 @@ def cmd_set(key, value):
     prefixes = {"gain": ("pre",), "hpf": ("hp",), "suppress": ("rnnoise",), "gate": ("gate",),
                 "tone": ("box", "nasal", "presence", "air"), "comp": ("comp",), "limit": ("limit",)}[stage]
     live = False
+    changed = {k: v for k, v in controls(settings).items() if k.split(":", 1)[0] in prefixes}
+    sampled = apply_to_sample(changed)
     if source_present(SOURCE):
-        live = apply_live({k: v for k, v in controls(settings).items() if k.split(":", 1)[0] in prefixes})
+        live = apply_live(changed)
         write_file(PIPEWIRE_DIR, HOST_CONF, render(settings, resolve_device(settings)), 0o644)
-    emit({"ok": True, "key": key, "value": settings[key], "live": live})
+    emit({"ok": True, "key": key, "value": settings[key], "live": live, "sample": sampled})
 
 
 def cmd_device(name):
@@ -1021,6 +1053,7 @@ def cmd_reset():
     fresh = {key: spec[0] for key, spec in SETTINGS.items()}
     fresh["device"] = settings["device"]
     save_settings(fresh)
+    apply_to_sample(controls(fresh))
     if source_present(SOURCE):
         apply_live(controls(fresh))
         write_file(PIPEWIRE_DIR, HOST_CONF, render(fresh, resolve_device(fresh)), 0o644)
@@ -1432,6 +1465,132 @@ def cmd_calibrate_clear():
     emit({"ok": True})
 
 
+# ---------------------------------------------------------------- sample loop
+
+def sample_info():
+    data = read_file(RUNTIME_DIR, "sample.wav", 32 << 20, binary=True)
+    if data is None:
+        return None
+    try:
+        frames = wav_frames(data)
+    except (ValueError, wave.Error, EOFError):
+        return None
+    return {"seconds": round(len(frames) / 2.0 / RATE, 1)}
+
+
+def cmd_sample_record(seconds):
+    try:
+        seconds = float(seconds)
+    except ValueError:
+        fail("seconds must be a number")
+    seconds = min(SAMPLE_MAX_SECONDS, max(2.0, seconds))
+    device = resolve_device(load_settings())
+    if not device or not source_present(device):
+        fail("no input device to record")
+    # The raw microphone, before any processing, so the loop can play it back
+    # through whatever settings you try.
+    proc = spawn(["parec", "-d", device, "--format=float32le", "--rate=%d" % RATE,
+                  "--channels=1", "--raw", "--latency-msec=50"], stdout=subprocess.PIPE)
+    if proc is None:
+        fail("couldn't record the microphone")
+    clip = array.array("f")
+    need = WINDOW * 4
+    total = int(seconds * RATE)
+    deadline = time.monotonic() + seconds + 10.0
+    buf = b""
+    try:
+        while len(clip) < total and time.monotonic() < deadline:
+            chunk = proc.stdout.read(need - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) == need:
+                a = array.array("f", buf)
+                clip.extend(a)
+                sys.stdout.write("level %.1f %.1f\n" % (to_db(math.sqrt(sum(x * x for x in a) / len(a))),
+                                                        len(clip) / float(RATE)))
+                sys.stdout.flush()
+                buf = b""
+    finally:
+        stop(proc)
+    if len(clip) < RATE:
+        fail("too little audio was recorded")
+    write_file(RUNTIME_DIR, "sample.wav", wav_bytes(clip[:total]), 0o600)
+    emit({"ok": True, "seconds": round(min(len(clip), total) / float(RATE), 1)})
+
+
+def cmd_sample_play(mode):
+    if mode not in ("processed", "original"):
+        fail("play processed or original")
+    data = read_file(RUNTIME_DIR, "sample.wav", 32 << 20, binary=True)
+    if data is None:
+        fail("record a sample first")
+    pcm = wav_frames(data)
+    if len(pcm) < RATE * 2:
+        fail("the sample is too short")
+    sink_before, source_before = default_sink(), default_source()
+    module = chain = player = None
+    deadline = time.monotonic() + SAMPLE_LOOP_LIMIT
+    # Stopping is the normal way a loop ends. The usual handler would close the
+    # player's pipe from under a write in progress, so here a signal only asks
+    # the loop to finish its current tenth of a second and tidy up.
+    stopping = threading.Event()
+    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(number, lambda *_: stopping.set())
+    try:
+        if mode == "processed":
+            done = run(["pactl", "load-module", "module-null-sink", "sink_name=" + SAMPLE_SINK,
+                        "sink_properties=device.description=Mic-FX-sample"])
+            module = done.stdout.strip() if done and done.returncode == 0 else None
+            if not module:
+                fail("couldn't create the sample's temporary sink")
+            write_file(RUNTIME_DIR, "sample.conf", render(load_settings(), SAMPLE_SINK, sample=True), 0o600)
+            chain = spawn(["pipewire", "-c", os.path.join(RUNTIME_DIR, "sample.conf")])
+            if chain is None:
+                fail("couldn't start the sample chain")
+            if not wait_for(lambda: node_id(SAMPLE_CAPTURE) is not None, 8):
+                fail("the sample chain didn't start")
+            # A loaded null sink can become the default; it mustn't stay that way.
+            if sink_before and default_sink() != sink_before:
+                run(["pactl", "set-default-sink", sink_before])
+            target = ["-d", SAMPLE_SINK]
+        else:
+            target = []
+        player = spawn(["pacat", "--playback"] + target + ["--format=s16le", "--rate=%d" % RATE,
+                        "--channels=1", "--latency-msec=100"], stdin=subprocess.PIPE)
+        if player is None:
+            fail("couldn't play the sample")
+        sys.stdout.write("playing %s\n" % mode)
+        sys.stdout.flush()
+        step = WINDOW * 2
+        while time.monotonic() < deadline and not stopping.is_set():
+            for offset in range(0, len(pcm), step):
+                if stopping.is_set():
+                    break
+                player.stdin.write(pcm[offset:offset + step])
+                sys.stdout.write("progress %.3f\n" % min(1.0, (offset + step) / float(len(pcm))))
+                sys.stdout.flush()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    finally:
+        for proc in (player, chain):
+            stop(proc)
+        if module:
+            run(["pactl", "unload-module", module])
+        if sink_before and default_sink() != sink_before:
+            run(["pactl", "set-default-sink", sink_before])
+        if source_before and default_source() != source_before:
+            run(["pactl", "set-default-source", source_before])
+        remove_file(RUNTIME_DIR, "sample.conf")
+    emit({"ok": True})
+
+
+def cmd_sample_clear():
+    for name in ("sample.wav", "sample.conf"):
+        remove_file(RUNTIME_DIR, name)
+    emit({"ok": True})
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv):
@@ -1472,6 +1631,12 @@ def main(argv):
             return cmd_calibrate_clear()
         if cmd == "calibrate" and len(rest) == 2:
             return cmd_calibrate(rest[0], rest[1])
+        if cmd == "sample" and len(rest) == 2 and rest[0] == "record":
+            return cmd_sample_record(rest[1])
+        if cmd == "sample" and len(rest) == 2 and rest[0] == "play":
+            return cmd_sample_play(rest[1])
+        if cmd == "sample" and rest == ["clear"]:
+            return cmd_sample_clear()
     except OSError as e:
         fail(str(e))
     sys.stderr.write(__doc__)

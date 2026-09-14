@@ -49,7 +49,8 @@ Panel {
   }
 
   readonly property var helpers: [statusProc, setProc, actionProc, calibProc,
-                                  solveProc, previewProc, playProc, clearProc]
+                                  solveProc, previewProc, playProc, clearProc,
+                                  sampleRecProc, sampleLoopProc]
 
   // The watchdog. Anything past its deadline is asked to stop, and killed if
   // it is still there five seconds later, so nothing this widget starts can
@@ -87,6 +88,103 @@ Panel {
   property var moreStages: ({})
 
   function flip(map, id) { return withKey(map, id, map[id] !== true) }
+
+  // ---- Sample loop --------------------------------------------------------
+  // A short recording of the raw mic, looped through a private copy of the
+  // chain that follows every slider, so settings can be judged by ear without
+  // your own voice in the way. "Original" loops it unprocessed, to compare.
+  readonly property int sampleSeconds: 10
+  readonly property var sampleInfo: status && status.sample ? status.sample : null
+  property bool sampleRecording: false
+  property real sampleElapsed: 0
+  property real sampleLevel: -120
+  property bool samplePlaying: false
+  property string sampleMode: "processed"
+  property real sampleProgress: 0
+  property bool sampleRestart: false
+
+  function recordSample() {
+    if (sampleRecording || busyAction !== "" || recording) return
+    stopSample()
+    sampleElapsed = 0
+    sampleLevel = -120
+    sampleRecording = true
+    sampleRecProc.command = helper(["sample", "record", String(sampleSeconds)])
+    sampleRecProc.running = true
+  }
+
+  function startSample() {
+    if (!sampleInfo || sampleRecording || sampleLoopProc.running) return
+    sampleProgress = 0
+    sampleLoopProc.command = helper(["sample", "play", sampleMode])
+    sampleLoopProc.running = true
+  }
+
+  function stopSample() {
+    sampleRestart = false
+    if (sampleLoopProc.running) sampleLoopProc.running = false
+  }
+
+  function toggleSample() {
+    if (sampleLoopProc.running) stopSample()
+    else startSample()
+  }
+
+  function setSampleMode(mode) {
+    if (mode === sampleMode) return
+    sampleMode = mode
+    if (sampleLoopProc.running) {
+      sampleRestart = true
+      sampleLoopProc.running = false
+    }
+  }
+
+  Helper {
+    id: sampleRecProc
+    deadlineSeconds: 45
+    stdout: SplitParser {
+      onRead: function(line) {
+        var s = String(line)
+        if (s.indexOf("level ") === 0) {
+          var parts = s.split(" ")
+          fx.sampleLevel = parseFloat(parts[1])
+          fx.sampleElapsed = parseFloat(parts[2])
+          return
+        }
+        var r = fx.parseLine(s)
+        if (r && r.ok === false) fx.flash(r.error || "Couldn't record a sample", true)
+      }
+    }
+    onExited: function(exitCode) {
+      fx.sampleRecording = false
+      fx.refresh()
+      if (exitCode === 0) fx.flash("Recorded. Press Loop, then adjust.", false)
+    }
+  }
+
+  // Stopped by the panel, not by finishing: it plays until asked, and gives
+  // up by itself after half an hour if it's forgotten.
+  Helper {
+    id: sampleLoopProc
+    deadlineSeconds: 1830
+    stdout: SplitParser {
+      onRead: function(line) {
+        var s = String(line)
+        if (s.indexOf("progress ") === 0) { fx.sampleProgress = parseFloat(s.slice(9)); return }
+        if (s.indexOf("playing ") === 0) { fx.samplePlaying = true; return }
+        var r = fx.parseLine(s)
+        if (r && r.ok === false) fx.flash(r.error || "Couldn't play the sample", true)
+      }
+    }
+    onExited: {
+      fx.samplePlaying = false
+      fx.sampleProgress = 0
+      if (fx.sampleRestart) {
+        fx.sampleRestart = false
+        fx.startSample()
+      }
+    }
+  }
 
   // Not "settings": the Panel base already uses that name for this widget's
   // own shell.json options, which setting() reads.
@@ -288,6 +386,7 @@ Panel {
 
   // ---- Wizard -------------------------------------------------------------
   function openWizard() {
+    stopSample()
     wizard = true
     step = -1
     results = ({})
@@ -515,7 +614,10 @@ Panel {
     closeWizard()
   }
 
-  onOpenedChanged: if (opened) { openStages = ({}); moreStages = ({}); refresh() }
+  onOpenedChanged: {
+    if (opened) { openStages = ({}); moreStages = ({}); refresh() }
+    else stopSample()        // a loop never outlives the panel
+  }
   // Leaving the typing step hands the keyboard back to the panel, so Escape
   // and Tab work again.
   onStepChanged: if (!(phase && phase.typing === true) && typingField.activeFocus) keyCatcher.forceActiveFocus()
@@ -769,6 +871,122 @@ Panel {
                 foreground: fx.fg
                 fontFamily: fx.fontFamily
                 onClicked: fx.openWizard()
+              }
+            }
+
+            PanelSeparator { foreground: fx.fg }
+
+            // Sample loop
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+
+              Item {
+                width: parent.width
+                implicitHeight: Math.max(sampleTitle.implicitHeight, sampleButtons.implicitHeight)
+
+                Column {
+                  anchors.left: parent.left
+                  anchors.right: sampleButtons.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(2)
+
+                  PanelSectionHeader {
+                    id: sampleTitle
+                    text: "SAMPLE"
+                    foreground: fx.fg
+                    fontFamily: fx.fontFamily
+                  }
+
+                  Text {
+                    width: parent.width
+                    text: fx.sampleRecording ? ("Recording… " + Math.max(0, fx.sampleSeconds - Math.floor(fx.sampleElapsed)) + " s, talk now")
+                      : fx.samplePlaying ? (fx.sampleMode === "processed" ? "Looping with your settings" : "Looping as recorded")
+                      : fx.sampleInfo ? ("Sample ready, " + fx.sampleInfo.seconds + " s. Loop it and adjust.")
+                      : "Record " + fx.sampleSeconds + " s of talking, then loop it while you adjust. Headphones."
+                    textFormat: Text.PlainText
+                    color: fx.dim
+                    font.family: fx.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.WordWrap
+                  }
+                }
+
+                Row {
+                  id: sampleButtons
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(6)
+
+                  Button {
+                    iconText: Model.ICON_RECORD
+                    text: fx.sampleRecording ? "Recording" : "Record"
+                    bordered: true
+                    active: fx.sampleRecording
+                    enabled: !fx.sampleRecording && fx.busyAction === ""
+                    foreground: fx.sampleRecording ? fx.urgent : fx.fg
+                    fontFamily: fx.fontFamily
+                    onClicked: fx.recordSample()
+                  }
+
+                  Button {
+                    iconText: sampleLoopProc.running ? Model.ICON_STOP : Model.ICON_LOOP
+                    text: sampleLoopProc.running ? "Stop" : "Loop"
+                    bordered: true
+                    enabled: fx.sampleInfo !== null && !fx.sampleRecording
+                    foreground: fx.fg
+                    fontFamily: fx.fontFamily
+                    onClicked: fx.toggleSample()
+                  }
+                }
+              }
+
+              LevelBar {
+                visible: fx.sampleRecording
+                width: parent.width
+                label: "Level"
+                db: fx.sampleLevel
+              }
+
+              // Where the loop is in the sample.
+              Rectangle {
+                visible: fx.samplePlaying
+                width: parent.width
+                height: Style.space(4)
+                radius: height / 2
+                color: Util.alpha(fx.fg, 0.12)
+
+                Rectangle {
+                  width: parent.width * fx.sampleProgress
+                  height: parent.height
+                  radius: parent.radius
+                  color: fx.fg
+                }
+              }
+
+              // A / B: the same sample with your settings, or as it was recorded.
+              Row {
+                visible: fx.sampleInfo !== null && !fx.sampleRecording
+                spacing: Style.space(6)
+
+                Button {
+                  text: "With settings"
+                  bordered: true
+                  selected: fx.sampleMode === "processed"
+                  foreground: fx.fg
+                  fontFamily: fx.fontFamily
+                  onClicked: fx.setSampleMode("processed")
+                }
+
+                Button {
+                  text: "Original"
+                  bordered: true
+                  selected: fx.sampleMode === "original"
+                  foreground: fx.fg
+                  fontFamily: fx.fontFamily
+                  onClicked: fx.setSampleMode("original")
+                }
               }
             }
 
