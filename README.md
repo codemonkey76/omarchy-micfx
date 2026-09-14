@@ -12,6 +12,8 @@ input that becomes your default:
 A setup wizard listens to your room, your voice and your typing, then suggests
 settings.
 
+What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
+
 ![The Mic FX panel](preview.png)
 
 ## What you get
