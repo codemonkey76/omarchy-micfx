@@ -32,7 +32,8 @@ settings.
   - one line per stage, with its own switch and a summary of what it's doing
     (`−50 dB`, `nasal −5 dB @ 1.1 kHz`). Click a stage to open its everyday
     sliders; **More** shows the rest (attack, release, frequencies and
-    widths). Stages start closed each time the panel opens. Changes apply
+    widths). Stages start closed each time the panel opens. An open stage that differs
+    from its defaults shows a reset icon that puts just that stage back. Changes apply
     live, without interrupting a call.
   - **Setup wizard**: three short recordings (quiet, talking, typing) with live
     before/after level meters. It then shows what it measured and the settings
@@ -240,6 +241,7 @@ omarchy-mic-fx set gate.threshold -48
 omarchy-mic-fx set tone.enabled on
 omarchy-mic-fx set tone.nasal.cut -5
 omarchy-mic-fx reset              # back to the default settings
+omarchy-mic-fx reset tone         # just one stage: input, hpf, suppress, gate, tone, comp, limit
 omarchy-mic-fx devices            # inputs it can process
 omarchy-mic-fx device <name>      # process a different one
 omarchy-mic-fx calibrate quiet 8  # also: speech, typing, solve, apply

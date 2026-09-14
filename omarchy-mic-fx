@@ -15,7 +15,7 @@ never restarts the audio daemon.
   omarchy-mic-fx set KEY VALUE           change one setting, live and saved
   omarchy-mic-fx device NAME             process a different input device
   omarchy-mic-fx devices                 input devices that can be processed
-  omarchy-mic-fx reset                   back to the default settings
+  omarchy-mic-fx reset [STAGE]           back to the default settings, or one stage's
   omarchy-mic-fx render                  print the PipeWire config it would use
   omarchy-mic-fx uninstall               stop it and remove its service and config
   omarchy-mic-fx calibrate PHASE SECS    record one wizard phase: quiet, speech or typing
@@ -956,6 +956,7 @@ def cmd_status():
                    "present": bool(device) and source_present(device)},
         "devices": input_devices(),
         "settings": {k: settings[k] for k in SETTINGS},
+        "defaults": {k: spec[0] for k, spec in SETTINGS.items()},
         "calibration": {"phases": calib, "suggestion": read_json(CALIBRATION_DIR, "suggestion.json", None)},
         "sample": sample_info(),
     })
@@ -1024,8 +1025,7 @@ def cmd_set(key, value):
         fail(str(e))
     save_settings(settings)
     stage = key.split(".")[0]
-    prefixes = {"gain": ("pre",), "hpf": ("hp",), "suppress": ("rnnoise",), "gate": ("gate",),
-                "tone": ("box", "nasal", "presence", "air"), "comp": ("comp",), "limit": ("limit",)}[stage]
+    prefixes = STAGE_NODES[stage]
     live = False
     changed = {k: v for k, v in controls(settings).items() if k.split(":", 1)[0] in prefixes}
     sampled = apply_to_sample(changed)
@@ -1048,16 +1048,29 @@ def cmd_device(name):
     emit({"ok": True, "device": name})
 
 
-def cmd_reset():
+# A stage's settings are the keys under its name; the input stage is "gain".
+STAGE_NODES = {"gain": ("pre",), "hpf": ("hp",), "suppress": ("rnnoise",), "gate": ("gate",),
+               "tone": ("box", "nasal", "presence", "air"), "comp": ("comp",), "limit": ("limit",)}
+
+
+def cmd_reset(stage=None):
+    if stage == "input":
+        stage = "gain"
+    if stage is not None and stage not in STAGE_NODES:
+        fail("unknown stage %r" % stage)
     settings = load_settings()
-    fresh = {key: spec[0] for key, spec in SETTINGS.items()}
-    fresh["device"] = settings["device"]
+    fresh = dict(settings)
+    for key, spec in SETTINGS.items():
+        if stage is None or key.split(".")[0] == stage:
+            fresh[key] = spec[0]
     save_settings(fresh)
-    apply_to_sample(controls(fresh))
+    nodes = STAGE_NODES[stage] if stage else None
+    values = {k: v for k, v in controls(fresh).items() if nodes is None or k.split(":", 1)[0] in nodes}
+    apply_to_sample(values)
     if source_present(SOURCE):
-        apply_live(controls(fresh))
+        apply_live(values)
         write_file(PIPEWIRE_DIR, HOST_CONF, render(fresh, resolve_device(fresh)), 0o644)
-    emit({"ok": True})
+    emit({"ok": True, "stage": stage})
 
 
 def cmd_uninstall():
@@ -1611,8 +1624,8 @@ def main(argv):
             return cmd_device(rest[0])
         if cmd == "devices":
             return emit({"ok": True, "devices": input_devices()})
-        if cmd == "reset":
-            return cmd_reset()
+        if cmd == "reset" and len(rest) <= 1:
+            return cmd_reset(rest[0] if rest else None)
         if cmd == "render":
             settings = load_settings()
             sys.stdout.write(render(settings, resolve_device(settings)))

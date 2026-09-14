@@ -377,6 +377,17 @@ Panel {
     act(["device", name], "Switching microphone…", "Now processing " + label)
   }
   function resetAll() { act(["reset"], "Resetting…", "Back to the default settings") }
+  function resetStage(spec) {
+    // Drop anything still waiting to be sent for this stage, or it would be
+    // sent after the reset and undo it.
+    var keys = spec.controls.map(function(c) { return c.key })
+    if (spec.toggle) keys.push(spec.toggle)
+    queue = queue.filter(function(k) { return keys.indexOf(k) === -1 })
+    var next = {}
+    for (var k in pending) if (keys.indexOf(k) === -1) next[k] = pending[k]
+    pending = next
+    act(["reset", spec.id], "Resetting…", spec.title.charAt(0) + spec.title.slice(1).toLowerCase() + " is back to its defaults")
+  }
 
   Timer {
     id: messageTimer
@@ -879,7 +890,9 @@ Panel {
             // Sample loop
             Column {
               width: parent.width
-              spacing: Style.space(6)
+              topPadding: Style.space(4)
+              bottomPadding: Style.space(4)
+              spacing: Style.space(10)
 
               Item {
                 width: parent.width
@@ -890,7 +903,7 @@ Panel {
                   anchors.right: sampleButtons.left
                   anchors.rightMargin: Style.space(8)
                   anchors.verticalCenter: parent.verticalCenter
-                  spacing: Style.space(2)
+                  spacing: Style.space(4)
 
                   PanelSectionHeader {
                     id: sampleTitle
@@ -968,7 +981,7 @@ Panel {
               // A / B: the same sample with your settings, or as it was recorded.
               Row {
                 visible: fx.sampleInfo !== null && !fx.sampleRecording
-                spacing: Style.space(6)
+                spacing: Style.space(8)
 
                 Button {
                   text: "With settings"
@@ -1388,6 +1401,8 @@ Panel {
     readonly property bool expanded: fx.openStages[stageId] === true
     readonly property bool more: fx.moreStages[stageId] === true
     readonly property bool hasMore: Model.hasAdvanced(spec)
+    readonly property bool changed: Model.stageChanged(spec, function(k) { return fx.value(k, undefined) },
+                                                        fx.status ? fx.status.defaults : null)
     spacing: Style.space(8)
 
     PanelSeparator { foreground: fx.fg }
@@ -1424,10 +1439,26 @@ Panel {
         fontFamily: fx.fontFamily
       }
 
+      // Only on an open stage with something to put back, so closed stages
+      // stay one clean line.
+      PanelActionButton {
+        id: stageReset
+        visible: stage.expanded && stage.changed
+        anchors.right: stageSwitch.visible ? stageSwitch.left : parent.right
+        anchors.rightMargin: Style.space(6)
+        anchors.verticalCenter: parent.verticalCenter
+        iconText: Model.ICON_RESTORE
+        tooltipText: "Reset this stage"
+        enabled: fx.busyAction === ""
+        foreground: fx.fg
+        fontFamily: fx.fontFamily
+        onClicked: fx.resetStage(stage.spec)
+      }
+
       Text {
         anchors.left: stageHeader.right
         anchors.leftMargin: Style.space(10)
-        anchors.right: stageSwitch.visible ? stageSwitch.left : parent.right
+        anchors.right: stageReset.visible ? stageReset.left : stageSwitch.visible ? stageSwitch.left : parent.right
         anchors.rightMargin: Style.space(10)
         anchors.verticalCenter: parent.verticalCenter
         horizontalAlignment: Text.AlignRight

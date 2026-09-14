@@ -50,6 +50,21 @@ var STAGES = [
     { key: "limit.ceiling", label: "Ceiling", unit: "dB", min: -24, max: 0, step: 0.5 } ] }
 ]
 
+// Whether anything in a stage differs from its default. `get(key)` reads a
+// setting, `defaults` is the helper's table of them.
+function stageChanged(spec, get, defaults) {
+  if (!spec || !defaults) return false
+  var keys = spec.controls.map(function(c) { return c.key })
+  if (spec.toggle) keys.push(spec.toggle)
+  for (var i = 0; i < keys.length; i++) {
+    var d = defaults[keys[i]]
+    if (d === undefined) continue
+    var v = get(keys[i])
+    if (typeof d === "boolean" ? v !== d : Math.abs(Number(v) - Number(d)) > 1e-6) return true
+  }
+  return false
+}
+
 function hasAdvanced(spec) {
   if (!spec) return false
   for (var i = 0; i < spec.controls.length; i++) if (spec.controls[i].advanced === true) return true
